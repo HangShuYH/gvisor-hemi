@@ -35,6 +35,7 @@ go_library(
         "fs.go",
         "fuse.go",
         "futex.go",
+        "hemi_gvisor.go",
         "inotify.go",
         "ioctl.go",
         "ioctl_tun.go",

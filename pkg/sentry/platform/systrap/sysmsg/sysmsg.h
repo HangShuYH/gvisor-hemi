@@ -16,6 +16,7 @@
 #define THIRD_PARTY_GVISOR_PKG_SENTRY_PLATFORM_SYSTRAP_SYSMSG_SYSMSG_H_
 
 #include <stdint.h>
+#include <sys/ioctl.h>
 #include <sys/types.h>
 #include <sys/user.h>
 
@@ -36,6 +37,26 @@ struct arch_state {
 };
 // LINT.ThenChange(sysmsg_arm64.go)
 #endif
+
+struct hemi_gvisor_map_file {
+  uint64_t addr;
+  uint64_t len;
+  uint64_t prot;
+  uint64_t flags;
+  int64_t guest_fd;
+  uint64_t guest_offset;
+  int64_t host_fd;
+  uint64_t host_offset;
+};
+
+#define HEMI_GVISOR_IOCTL_TYPE 'H'
+#define HEMI_GVISOR_MAP_FILE \
+  _IOW(HEMI_GVISOR_IOCTL_TYPE, 0x01, struct hemi_gvisor_map_file)
+
+enum hemi_gvisor_op {
+  HEMI_GVISOR_OP_NONE = 0,
+  HEMI_GVISOR_OP_MAP_FILE = 1,
+};
 
 // LINT.IfChange
 enum thread_state {
@@ -100,6 +121,10 @@ struct thread_context {
   uint64_t tls;
   uint64_t debug;
   uint64_t err;
+  uint64_t hemi_op;
+  uint64_t hemi_device_fd;
+  uint64_t hemi_host_fd;
+  uint64_t hemi_host_offset;
 };
 
 enum stub_error {

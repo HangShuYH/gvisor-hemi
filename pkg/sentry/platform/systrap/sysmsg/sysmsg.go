@@ -276,6 +276,15 @@ type ThreadContext struct {
 	Debug uint64
 	// SigError is an error code that clarifies the nature of the signal.
 	SigError uint64
+	// HemiOp is a HEMI gVisor operation that the stub must complete before
+	// resuming user execution.
+	HemiOp uint64
+	// HemiDeviceFD is the host fd for /dev/hemi_gvisor.
+	HemiDeviceFD uint64
+	// HemiHostFD is the host fd backing a guest file mapping.
+	HemiHostFD uint64
+	// HemiHostOffset is the host file offset for HemiHostFD.
+	HemiHostOffset uint64
 }
 
 // StubError are values that represent known stub-thread failure modes.
@@ -322,6 +331,7 @@ func (c *ThreadContext) Init(initialThreadID uint32) {
 	c.SignalInfo = linux.SignalInfo{}
 	c.State = ContextStateNone
 	c.ThreadID = initialThreadID
+	c.HemiOp = linux.HEMI_GVISOR_OP_NONE
 }
 
 // ConvertSysmsgErr converts m.Err to platform.ContextError.

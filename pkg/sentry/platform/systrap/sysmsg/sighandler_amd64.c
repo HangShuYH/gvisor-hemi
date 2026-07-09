@@ -61,6 +61,36 @@ long sys_futex(uint32_t *addr, int op, int val, struct __kernel_timespec *tv,
                    (long)addr2, (long)val3);
 }
 
+static void hemi_gvisor_complete_op(struct thread_context *ctx) {
+  if (atomic_load(&ctx->hemi_op) != HEMI_GVISOR_OP_MAP_FILE) {
+    return;
+  }
+  atomic_store(&ctx->hemi_op, HEMI_GVISOR_OP_NONE);
+
+  // The generic sentry mmap has already executed at this point. If it failed,
+  // there is no app-visible mapping to mirror into HEMI.
+  uint64_t mmap_ret = ctx->ptregs.rax;
+  if (mmap_ret >= (uint64_t)-4095) {
+    return;
+  }
+
+  struct hemi_gvisor_map_file req = {
+      .addr = ctx->ptregs.rdi,
+      .len = ctx->ptregs.rsi,
+      .prot = ctx->ptregs.rdx,
+      .flags = ctx->ptregs.r10,
+      .guest_fd = (int64_t)ctx->ptregs.r8,
+      .guest_offset = ctx->ptregs.r9,
+      .host_fd = (int64_t)ctx->hemi_host_fd,
+      .host_offset = ctx->hemi_host_offset,
+  };
+
+  // This is a mirror operation. Leave ptregs.rax untouched so the generic
+  // sentry mmap syscall remains the source of the app-visible return value.
+  (void)__syscall(__NR_ioctl, ctx->hemi_device_fd, HEMI_GVISOR_MAP_FILE,
+                  (long)&req, 0, 0, 0);
+}
+
 union csgsfs {
   uint64_t csgsfs;  // REG_CSGSFS
   struct {
@@ -171,6 +201,7 @@ struct thread_context *switch_context_amd64(
 
   for (;;) {
     ctx = switch_context(sysmsg, ctx, new_context_state);
+    hemi_gvisor_complete_op(ctx);
 
     // After setting THREAD_STATE_NONE, syshandled can be interrupted by
     // SIGCHLD. In this case, we consider that the current context contains
