@@ -15,14 +15,17 @@
 package systrap
 
 import (
+	"errors"
+	"fmt"
 	"runtime"
 	"sync"
-	"sync/atomic"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
@@ -36,10 +39,36 @@ const hemiGvisorDevicePath = "/dev/hemi_gvisor"
 
 var hemiGvisorDevice = struct {
 	sync.Mutex
-	fd       int32
-	disabled bool
+	file *fd.FD
+	fd   int32
 }{
 	fd: -1,
+}
+
+func hemiGvisorOpenDevice(devicePath string) (*fd.FD, error) {
+	if devicePath == "" {
+		devicePath = hemiGvisorDevicePath
+	}
+	f, err := fd.Open(devicePath, unix.O_RDWR|unix.O_CLOEXEC, 0)
+	if err != nil {
+		if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ENODEV) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("opening HEMI gVisor device file (%s): %w", devicePath, err)
+	}
+	return f, nil
+}
+
+func hemiGvisorSetDeviceFD(deviceFile *fd.FD) {
+	if deviceFile == nil {
+		return
+	}
+
+	hemiGvisorDevice.Lock()
+	defer hemiGvisorDevice.Unlock()
+
+	hemiGvisorDevice.file = deviceFile
+	hemiGvisorDevice.fd = int32(deviceFile.FD())
 }
 
 func hemiGvisorDeviceFD() (int32, bool) {
@@ -49,18 +78,7 @@ func hemiGvisorDeviceFD() (int32, bool) {
 	if hemiGvisorDevice.fd >= 0 {
 		return hemiGvisorDevice.fd, true
 	}
-	if hemiGvisorDevice.disabled {
-		return -1, false
-	}
-
-	fd, err := unix.Open(hemiGvisorDevicePath, unix.O_RDWR|unix.O_CLOEXEC, 0)
-	if err != nil {
-		hemiGvisorDevice.disabled = true
-		log.Warningf("HEMI gVisor device unavailable: %v", err)
-		return -1, false
-	}
-	hemiGvisorDevice.fd = int32(fd)
-	return hemiGvisorDevice.fd, true
+	return -1, false
 }
 
 type hemiGvisorTask interface {
@@ -87,32 +105,36 @@ func (s *subprocess) prepareHemiGvisorMapFile(ctx context.Context, c *platformCo
 	}
 	hostFD, hostOffset, err := hemiGvisorLookupHostFile(ctx, task, prot, flags, args)
 	if err != nil {
-		c.clearHemiGvisorOp()
 		log.Warningf("HEMI gVisor MAP_FILE lookup failed, falling back to sentry mmap: %v", err)
 		return
 	}
-	if !c.prepareHemiGvisorMapFile(devFD, int32(hostFD), hostOffset) {
+	req := linux.HemiGvisorMapFile{
+		Addr:        args[0].Uint64(),
+		Len:         args[1].Uint64(),
+		Prot:        args[2].Uint64(),
+		Flags:       args[3].Uint64(),
+		GuestFD:     int64(args[4].Int()),
+		GuestOffset: args[5].Uint64(),
+		HostFD:      int64(hostFD),
+		HostOffset:  hostOffset,
+	}
+	s.hemiGvisorMapFileIoctl(int32(devFD), req)
+}
+
+func (s *subprocess) hemiGvisorMapFileIoctl(devFD int32, req linux.HemiGvisorMapFile) {
+	s.syscallThreadMu.Lock()
+	defer s.syscallThreadMu.Unlock()
+
+	t := s.syscallThread
+	if t == nil {
 		return
 	}
-}
-
-func (c *platformContext) prepareHemiGvisorMapFile(devFD, hostFD int32, hostOffset uint64) bool {
-	if c.sharedContext == nil {
-		return false
-	}
-	tc := c.sharedContext.shared
-	atomic.StoreUint64(&tc.HemiOp, linux.HEMI_GVISOR_OP_NONE)
-	atomic.StoreUint64(&tc.HemiDeviceFD, uint64(uint32(devFD)))
-	atomic.StoreUint64(&tc.HemiHostFD, uint64(uint32(hostFD)))
-	atomic.StoreUint64(&tc.HemiHostOffset, hostOffset)
-	atomic.StoreUint64(&tc.HemiOp, linux.HEMI_GVISOR_OP_MAP_FILE)
-	return true
-}
-
-func (c *platformContext) clearHemiGvisorOp() {
-	if c.sharedContext != nil {
-		atomic.StoreUint64(&c.sharedContext.shared.HemiOp, linux.HEMI_GVISOR_OP_NONE)
-	}
+	t.sentryMessage.hemiMapFile = req
+	reqAddr := t.stubAddr + unsafe.Offsetof(syscallSentryMessage{}.hemiMapFile)
+	_, _ = t.syscall(unix.SYS_IOCTL,
+		arch.SyscallArgument{Value: uintptr(uint32(devFD))},
+		arch.SyscallArgument{Value: uintptr(linux.HEMI_GVISOR_MAP_FILE)},
+		arch.SyscallArgument{Value: reqAddr})
 }
 
 func hemiGvisorLookupHostFile(ctx context.Context, task hemiGvisorTask, prot, flags int32, args arch.SyscallArguments) (int, uint64, error) {
@@ -202,6 +224,11 @@ func hemiGvisorHostFile(ctx context.Context, opts *memmap.MMapOpts) (int, uint64
 		return -1, 0, linuxerr.EOVERFLOW
 	}
 	mr := memmap.MappableRange{Start: opts.Offset, End: end}
+	probeEnd := opts.Offset + uint64(hostarch.PageSize)
+	if probeEnd < opts.Offset || probeEnd > end {
+		probeEnd = end
+	}
+	probe := memmap.MappableRange{Start: opts.Offset, End: probeEnd}
 
 	at := opts.Perms
 	if opts.Private {
@@ -212,19 +239,19 @@ func hemiGvisorHostFile(ctx context.Context, opts *memmap.MMapOpts) (int, uint64
 		at.Read = true
 	}
 
-	ts, err := opts.Mappable.Translate(ctx, mr, mr, at)
+	ts, err := opts.Mappable.Translate(ctx, probe, mr, at)
 	if len(ts) == 0 {
 		if err != nil {
 			return -1, 0, err
 		}
 		return -1, 0, linuxerr.ENODEV
 	}
-	if ts[0].Source.Start > mr.Start || ts[0].Source.End < mr.End {
+	if !ts[0].Source.Contains(probe.Start) {
 		return -1, 0, linuxerr.ENODEV
 	}
 
 	hostOffset := ts[0].Offset + (mr.Start - ts[0].Source.Start)
-	fr := memmap.FileRange{Start: hostOffset, End: hostOffset + opts.Length}
+	fr := ts[0].FileRange()
 	ts[0].File.IncRef(fr, pgalloc.MemoryCgroupIDFromContext(ctx))
 	defer ts[0].File.DecRef(fr)
 

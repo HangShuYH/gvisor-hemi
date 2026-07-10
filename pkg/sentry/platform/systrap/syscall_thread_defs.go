@@ -15,6 +15,7 @@
 package systrap
 
 import (
+	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/hostarch"
 )
 
@@ -23,10 +24,11 @@ const syscallStubMessageOffset = hostarch.PageSize
 // syscallSentryMessage is a shared message that can be changed only from the
 // Sentry and a stub process can only read it.
 type syscallSentryMessage struct {
-	state  uint32
-	unused uint32
-	sysno  uint64
-	args   [6]uint64
+	state       uint32
+	unused      uint32
+	sysno       uint64
+	args        [6]uint64
+	hemiMapFile linux.HemiGvisorMapFile
 }
 
 // syscallStubMessage is a shared message that can be changed from a stub

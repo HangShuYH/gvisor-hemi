@@ -275,6 +275,7 @@ func (*Systrap) MinUserAddress() hostarch.Addr {
 
 // New returns a new seccomp-based implementation of the platform interface.
 func New(opts platform.Options) (*Systrap, error) {
+	hemiGvisorSetDeviceFD(opts.DeviceFile)
 
 	if !disableSyscallPatching {
 		disableSyscallPatching = opts.DisableSyscallPatching
@@ -332,8 +333,6 @@ func New(opts platform.Options) (*Systrap, error) {
 		return nil, stubErr
 	}
 
-	hemiGvisorDeviceFD()
-
 	if !neverEnableFastPath {
 		latencyMonitoring.Do(func() {
 			go controlFastPath()
@@ -385,8 +384,8 @@ func (*constructor) New(opts platform.Options) (platform.Platform, error) {
 	return New(opts)
 }
 
-func (*constructor) OpenDevice(_ string) (*fd.FD, error) {
-	return nil, nil
+func (*constructor) OpenDevice(devicePath string) (*fd.FD, error) {
+	return hemiGvisorOpenDevice(devicePath)
 }
 
 // Requirements implements platform.Constructor.Requirements().
