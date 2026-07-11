@@ -182,7 +182,10 @@ go_library(
 go_test(
     name = "mm_test",
     size = "small",
-    srcs = ["mm_test.go"],
+    srcs = [
+        "hemi_reservation_test.go",
+        "mm_test.go",
+    ],
     library = ":mm",
     deps = [
         "//pkg/context",

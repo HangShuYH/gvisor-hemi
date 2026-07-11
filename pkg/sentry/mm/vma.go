@@ -26,6 +26,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
+	"gvisor.dev/gvisor/pkg/sentry/platform"
 )
 
 // Caller provides the droppedIDs slice to collect dropped mapping
@@ -61,6 +62,9 @@ func (mm *MemoryManager) createVMALocked(ctx context.Context, opts memmap.MMapOp
 		}
 	}
 	ar, _ := addr.ToRange(opts.Length)
+	if ar.Overlaps(mm.reservedAR) {
+		return vmaIterator{}, hostarch.AddrRange{}, droppedIDs, linuxerr.ENOMEM
+	}
 
 	// Check against RLIMIT_AS.
 	newUsageAS := mm.usageAS + opts.Length
@@ -158,6 +162,22 @@ type findAvailableOpts struct {
 	Map32Bit  bool
 }
 
+func addressSpaceReservedRange(as platform.AddressSpace) hostarch.AddrRange {
+	if r, ok := as.(platform.AddressSpaceReservedRange); ok {
+		return r.ReservedAddressRange()
+	}
+	return hostarch.AddrRange{}
+}
+
+func splitAddressRangeAround(bounds, reserved hostarch.AddrRange) (hostarch.AddrRange, hostarch.AddrRange) {
+	intersection := bounds.Intersect(reserved)
+	if intersection.Length() == 0 {
+		return bounds, hostarch.AddrRange{}
+	}
+	return hostarch.AddrRange{Start: bounds.Start, End: intersection.Start},
+		hostarch.AddrRange{Start: intersection.End, End: bounds.End}
+}
+
 // map32Start/End are the bounds to which MAP_32BIT mappings are constrained,
 // and are equivalent to Linux's MAP32_BASE and MAP32_MAX respectively.
 const (
@@ -176,10 +196,11 @@ func (mm *MemoryManager) findAvailableLocked(length uint64, opts findAvailableOp
 	if opts.Map32Bit {
 		allowedAR = allowedAR.Intersect(hostarch.AddrRange{map32Start, map32End})
 	}
+	reservedAR := mm.reservedAR.Intersect(allowedAR)
 
 	// Does the provided suggestion work?
 	if ar, ok := opts.Addr.ToRange(length); ok {
-		if allowedAR.IsSupersetOf(ar) {
+		if allowedAR.IsSupersetOf(ar) && !ar.Overlaps(reservedAR) {
 			if opts.Unmap {
 				return ar.Start, nil
 			}
@@ -203,12 +224,14 @@ func (mm *MemoryManager) findAvailableLocked(length uint64, opts findAvailableOp
 	}
 
 	if opts.Map32Bit {
-		return mm.findLowestAvailableLocked(length, alignment, allowedAR)
+		return mm.findLowestAvailableOutsideLocked(length, alignment, allowedAR, reservedAR)
 	}
 	if mm.layout.DefaultDirection == arch.MmapBottomUp {
-		return mm.findLowestAvailableLocked(length, alignment, hostarch.AddrRange{mm.layout.BottomUpBase, mm.layout.MaxAddr})
+		return mm.findLowestAvailableOutsideLocked(length, alignment,
+			hostarch.AddrRange{mm.layout.BottomUpBase, mm.layout.MaxAddr}, reservedAR)
 	}
-	return mm.findHighestAvailableLocked(length, alignment, hostarch.AddrRange{mm.layout.MinAddr, mm.layout.TopDownBase})
+	return mm.findHighestAvailableOutsideLocked(length, alignment,
+		hostarch.AddrRange{mm.layout.MinAddr, mm.layout.TopDownBase}, reservedAR)
 }
 
 func (mm *MemoryManager) applicationAddrRange() hostarch.AddrRange {
@@ -234,6 +257,19 @@ func (mm *MemoryManager) findLowestAvailableLocked(length, alignment uint64, bou
 	return 0, linuxerr.ENOMEM
 }
 
+func (mm *MemoryManager) findLowestAvailableOutsideLocked(length, alignment uint64, bounds, reserved hostarch.AddrRange) (hostarch.Addr, error) {
+	below, above := splitAddressRangeAround(bounds, reserved)
+	if uint64(below.Length()) >= length {
+		if addr, err := mm.findLowestAvailableLocked(length, alignment, below); err == nil {
+			return addr, nil
+		}
+	}
+	if uint64(above.Length()) >= length {
+		return mm.findLowestAvailableLocked(length, alignment, above)
+	}
+	return 0, linuxerr.ENOMEM
+}
+
 // Preconditions: mm.mappingMu must be locked.
 func (mm *MemoryManager) findHighestAvailableLocked(length, alignment uint64, bounds hostarch.AddrRange) (hostarch.Addr, error) {
 	for gap := mm.vmas.UpperBoundGap(bounds.End); gap.Ok() && gap.End() > bounds.Start; gap = gap.PrevLargeEnoughGap(hostarch.Addr(length)) {
@@ -250,6 +286,19 @@ func (mm *MemoryManager) findHighestAvailableLocked(length, alignment uint64, bo
 			// Either aligned perfectly, or can't align it.
 			return start, nil
 		}
+	}
+	return 0, linuxerr.ENOMEM
+}
+
+func (mm *MemoryManager) findHighestAvailableOutsideLocked(length, alignment uint64, bounds, reserved hostarch.AddrRange) (hostarch.Addr, error) {
+	below, above := splitAddressRangeAround(bounds, reserved)
+	if uint64(above.Length()) >= length {
+		if addr, err := mm.findHighestAvailableLocked(length, alignment, above); err == nil {
+			return addr, nil
+		}
+	}
+	if uint64(below.Length()) >= length {
+		return mm.findHighestAvailableLocked(length, alignment, below)
 	}
 	return 0, linuxerr.ENOMEM
 }

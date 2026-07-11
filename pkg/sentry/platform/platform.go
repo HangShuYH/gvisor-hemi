@@ -441,6 +441,13 @@ type AddressSpaceIOAllSizes interface {
 	AddressSpaceIOAllSizes() bool
 }
 
+// AddressSpaceReservedRange is implemented by AddressSpaces that reserve a
+// virtual-address range for a platform-specific memory manager. Sentry must
+// not create VMAs in the returned half-open range.
+type AddressSpaceReservedRange interface {
+	ReservedAddressRange() hostarch.AddrRange
+}
+
 // NoAddressSpaceIO implements AddressSpaceIO methods by panicking.
 type NoAddressSpaceIO struct{}
 

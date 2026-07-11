@@ -155,6 +155,17 @@ func (s *subprocess) AddressSpaceIOAllSizes() bool {
 	return s.hemiGvisorUserMemTGID > 0
 }
 
+// ReservedAddressRange returns the user virtual-address range owned by HEMI.
+func (s *subprocess) ReservedAddressRange() hostarch.AddrRange {
+	if s.hemiGvisorUserMemTGID <= 0 {
+		return hostarch.AddrRange{}
+	}
+	return hostarch.AddrRange{
+		Start: hostarch.Addr(linux.HEMI_GVISOR_VMAR_START),
+		End:   hostarch.Addr(linux.HEMI_GVISOR_VMAR_END),
+	}
+}
+
 func (s *subprocess) CopyIn(addr hostarch.Addr, dst []byte) (int, error) {
 	if !hemiGvisorContainsUserMem(addr, uint64(len(dst))) {
 		return 0, platform.AddressSpaceIOUnavailable{}

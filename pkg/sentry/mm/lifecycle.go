@@ -39,6 +39,7 @@ func NewMemoryManager(p platform.Platform, mf *pgalloc.MemoryFile) (*MemoryManag
 		haveASIO:    p.SupportsAddressSpaceIO(),
 		users:       atomicbitops.FromInt32(1),
 		as:          as,
+		reservedAR:  addressSpaceReservedRange(as),
 		auxv:        arch.Auxv{},
 		dumpability: atomicbitops.FromInt32(int32(UserDumpable)),
 		aioManager:  aioManager{contexts: make(map[uint64]*AIOContext)},
@@ -81,15 +82,16 @@ func (mm *MemoryManager) Fork(ctx context.Context) (*MemoryManager, error) {
 	mm.mappingMu.RLock()
 	defer mm.mappingMu.RUnlock()
 	mm2 := &MemoryManager{
-		p:        mm.p,
-		mf:       mm.mf,
-		haveASIO: mm.haveASIO,
-		layout:   mm.layout,
-		users:    atomicbitops.FromInt32(1),
-		as:       as,
-		brk:      mm.brk,
-		usageAS:  mm.usageAS,
-		dataAS:   mm.dataAS,
+		p:          mm.p,
+		mf:         mm.mf,
+		haveASIO:   mm.haveASIO,
+		layout:     mm.layout,
+		users:      atomicbitops.FromInt32(1),
+		as:         as,
+		reservedAR: addressSpaceReservedRange(as),
+		brk:        mm.brk,
+		usageAS:    mm.usageAS,
+		dataAS:     mm.dataAS,
 		// "The child does not inherit its parent's memory locks (mlock(2),
 		// mlockall(2))." - fork(2). So lockedAS is 0 and defMLockMode is
 		// MLockNone, both of which are zero values. vma.mlockMode is reset

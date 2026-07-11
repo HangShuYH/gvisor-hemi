@@ -162,6 +162,10 @@ type MemoryManager struct {
 	// until users becomes 0, at which point as becomes nil.
 	as platform.AddressSpace `state:"nosave"`
 
+	// reservedAR is owned by the platform-specific memory manager and must not
+	// contain Sentry VMAs. It is immutable while as is non-nil.
+	reservedAR hostarch.AddrRange `state:"nosave"`
+
 	// If captureInvalidations is true, calls to MM.Invalidate() are recorded
 	// in capturedInvalidations rather than being applied immediately to pmas.
 	// This is to avoid a race condition in MM.Fork(); see that function for
