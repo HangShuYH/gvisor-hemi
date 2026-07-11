@@ -56,7 +56,7 @@ func TestHemiGvisorKeepSyscallUnpatched(t *testing.T) {
 		t.Fatal("inactive HEMI subprocess kept mmap unpatched")
 	}
 
-	active := subprocess{hemiGvisorUserMemTGID: 1}
+	active := subprocess{hemiGvisorTGID: 1}
 	for _, sysno := range []uintptr{unix.SYS_MMAP, unix.SYS_MUNMAP, unix.SYS_MPROTECT} {
 		if !active.hemiGvisorKeepSyscallUnpatched(sysno) {
 			t.Errorf("active HEMI subprocess allowed syscall %d to be patched", sysno)

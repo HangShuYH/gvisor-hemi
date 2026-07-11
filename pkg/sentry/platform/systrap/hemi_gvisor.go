@@ -28,7 +28,6 @@ import (
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/hostsyscall"
-	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
@@ -85,7 +84,7 @@ func hemiGvisorDeviceFD() (int32, bool) {
 	return -1, false
 }
 
-func (s *subprocess) hemiGvisorInitUserMem() error {
+func (s *subprocess) hemiGvisorInitAddressSpace() error {
 	if _, ok := hemiGvisorDeviceFD(); !ok {
 		return nil
 	}
@@ -97,12 +96,12 @@ func (s *subprocess) hemiGvisorInitUserMem() error {
 		return fmt.Errorf("HEMI gVisor subprocess has no host thread")
 	}
 
-	s.hemiGvisorUserMemTGID = int32(t.thread.tgid)
+	s.hemiGvisorTGID = int32(t.thread.tgid)
 	return s.hemiGvisorResetMM()
 }
 
-func (s *subprocess) hemiGvisorReleaseUserMem() {
-	s.hemiGvisorUserMemTGID = 0
+func (s *subprocess) hemiGvisorReleaseAddressSpace() {
+	s.hemiGvisorTGID = 0
 }
 
 func (s *subprocess) hemiGvisorResetMM() error {
@@ -110,17 +109,17 @@ func (s *subprocess) hemiGvisorResetMM() error {
 	if !ok {
 		return nil
 	}
-	if s.hemiGvisorUserMemTGID <= 0 {
+	if s.hemiGvisorTGID <= 0 {
 		return fmt.Errorf("HEMI gVisor reset has no target subprocess")
 	}
 
-	req := linux.HemiGvisorResetMM{TargetTGID: s.hemiGvisorUserMemTGID}
+	req := linux.HemiGvisorResetMM{TargetTGID: s.hemiGvisorTGID}
 	errno := hostsyscall.RawSyscallErrno6(
 		unix.SYS_IOCTL, uintptr(deviceFD), uintptr(linux.HEMI_GVISOR_RESET_MM),
 		uintptr(unsafe.Pointer(&req)), 0, 0, 0)
 	if errno != 0 {
 		return fmt.Errorf("HEMI gVisor reset mm ioctl for tgid %d: %w",
-			s.hemiGvisorUserMemTGID, errno)
+			s.hemiGvisorTGID, errno)
 	}
 	return nil
 }
@@ -136,21 +135,21 @@ func (s *subprocess) ForkAddressSpaceFrom(source platform.AddressSpace) error {
 	if !ok {
 		return fmt.Errorf("HEMI gVisor fork source has type %T", source)
 	}
-	if parent.hemiGvisorUserMemTGID <= 0 || s.hemiGvisorUserMemTGID <= 0 {
+	if parent.hemiGvisorTGID <= 0 || s.hemiGvisorTGID <= 0 {
 		return fmt.Errorf("HEMI gVisor fork has invalid parent/child tgid %d/%d",
-			parent.hemiGvisorUserMemTGID, s.hemiGvisorUserMemTGID)
+			parent.hemiGvisorTGID, s.hemiGvisorTGID)
 	}
 
 	req := linux.HemiGvisorForkMM{
-		ParentTGID: parent.hemiGvisorUserMemTGID,
-		ChildTGID:  s.hemiGvisorUserMemTGID,
+		ParentTGID: parent.hemiGvisorTGID,
+		ChildTGID:  s.hemiGvisorTGID,
 	}
 	errno := hostsyscall.RawSyscallErrno6(
 		unix.SYS_IOCTL, uintptr(deviceFD), uintptr(linux.HEMI_GVISOR_FORK_MM),
 		uintptr(unsafe.Pointer(&req)), 0, 0, 0)
 	if errno != 0 {
 		return fmt.Errorf("HEMI gVisor fork mm ioctl for parent/child tgid %d/%d: %w",
-			parent.hemiGvisorUserMemTGID, s.hemiGvisorUserMemTGID, errno)
+			parent.hemiGvisorTGID, s.hemiGvisorTGID, errno)
 	}
 	return nil
 }
@@ -160,7 +159,7 @@ func (s *subprocess) ForkAddressSpaceFrom(source platform.AddressSpace) error {
 // initially fall back to the sentry; allowing usertrap to patch that call site
 // would make later anonymous mmaps from the same site bypass the direct hook.
 func (s *subprocess) hemiGvisorKeepSyscallUnpatched(sysno uintptr) bool {
-	if s.hemiGvisorUserMemTGID <= 0 {
+	if s.hemiGvisorTGID <= 0 {
 		return false
 	}
 	switch sysno {
@@ -189,7 +188,7 @@ func (s *subprocess) hemiGvisorUserMem(addr hostarch.Addr, data []byte, write bo
 		return 0, platform.AddressSpaceIOUnavailable{}
 	}
 	deviceFD, ok := hemiGvisorDeviceFD()
-	if !ok || s.hemiGvisorUserMemTGID <= 0 {
+	if !ok || s.hemiGvisorTGID <= 0 {
 		return 0, platform.AddressSpaceIOUnavailable{}
 	}
 
@@ -197,7 +196,7 @@ func (s *subprocess) hemiGvisorUserMem(addr hostarch.Addr, data []byte, write bo
 		Addr:       uint64(addr),
 		Len:        uint64(len(data)),
 		UserBuf:    uint64(uintptr(unsafe.Pointer(&data[0]))),
-		TargetTGID: s.hemiGvisorUserMemTGID,
+		TargetTGID: s.hemiGvisorTGID,
 	}
 	cmd := linux.HEMI_GVISOR_READ_USER
 	if write {
@@ -218,7 +217,7 @@ func (s *subprocess) hemiGvisorUserMem(addr hostarch.Addr, data []byte, write bo
 // AddressSpaceIOAllSizes reports that HEMI owns the authoritative user page
 // tables, so Sentry internal mappings must not be selected based on size.
 func (s *subprocess) AddressSpaceIOAllSizes() bool {
-	return s.hemiGvisorUserMemTGID > 0
+	return s.hemiGvisorTGID > 0
 }
 
 // EnsureAccess faults in and validates a HEMI-managed user range without
@@ -228,7 +227,7 @@ func (s *subprocess) EnsureAccess(addr hostarch.Addr, length uint64, at hostarch
 		return 0, platform.AddressSpaceIOUnavailable{}
 	}
 	deviceFD, ok := hemiGvisorDeviceFD()
-	if !ok || s.hemiGvisorUserMemTGID <= 0 {
+	if !ok || s.hemiGvisorTGID <= 0 {
 		return 0, platform.AddressSpaceIOUnavailable{}
 	}
 
@@ -246,7 +245,7 @@ func (s *subprocess) EnsureAccess(addr hostarch.Addr, length uint64, at hostarch
 	req := linux.HemiGvisorProbeUser{
 		Addr:       uint64(addr),
 		Len:        length,
-		TargetTGID: s.hemiGvisorUserMemTGID,
+		TargetTGID: s.hemiGvisorTGID,
 		Access:     access,
 	}
 	errno := hostsyscall.RawSyscallErrno6(
@@ -263,7 +262,7 @@ func (s *subprocess) EnsureAccess(addr hostarch.Addr, length uint64, at hostarch
 
 // ReservedAddressRange returns the user virtual-address range owned by HEMI.
 func (s *subprocess) ReservedAddressRange() hostarch.AddrRange {
-	if s.hemiGvisorUserMemTGID <= 0 {
+	if s.hemiGvisorTGID <= 0 {
 		return hostarch.AddrRange{}
 	}
 	return hostarch.AddrRange{
@@ -330,9 +329,6 @@ func (s *subprocess) CompareAndSwapUint32(addr hostarch.Addr, old, value uint32)
 }
 
 func (s *subprocess) LoadUint32(addr hostarch.Addr) (uint32, error) {
-	if !hemiGvisorContainsUserMem(addr, 4) {
-		return 0, platform.AddressSpaceIOUnavailable{}
-	}
 	return s.hemiGvisorAtomicUint32(addr, linux.HEMI_GVISOR_ATOMIC_U32_LOAD, 0, 0)
 }
 
@@ -341,13 +337,13 @@ func (s *subprocess) hemiGvisorAtomicUint32(addr hostarch.Addr, op, old, new uin
 		return 0, platform.AddressSpaceIOUnavailable{}
 	}
 	deviceFD, ok := hemiGvisorDeviceFD()
-	if !ok || s.hemiGvisorUserMemTGID <= 0 {
+	if !ok || s.hemiGvisorTGID <= 0 {
 		return 0, platform.AddressSpaceIOUnavailable{}
 	}
 
 	req := linux.HemiGvisorAtomicU32{
 		Addr:       uint64(addr),
-		TargetTGID: s.hemiGvisorUserMemTGID,
+		TargetTGID: s.hemiGvisorTGID,
 		Op:         op,
 		Old:        old,
 		New:        new,
@@ -388,7 +384,6 @@ func (s *subprocess) prepareHemiGvisorMapFile(ctx context.Context, c *platformCo
 	}
 	hostFD, hostOffset, err := hemiGvisorLookupHostFile(ctx, task, prot, flags, args)
 	if err != nil {
-		log.Warningf("HEMI gVisor MAP_FILE lookup failed, falling back to sentry mmap: %v", err)
 		return
 	}
 	req := linux.HemiGvisorMapFile{

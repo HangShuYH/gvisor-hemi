@@ -367,7 +367,7 @@ func (p *Systrap) NewAddressSpace() (platform.AddressSpace, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := s.hemiGvisorInitUserMem(); err != nil {
+	if err := s.hemiGvisorInitAddressSpace(); err != nil {
 		s.Release()
 		return nil, err
 	}
