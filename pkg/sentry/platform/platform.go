@@ -393,6 +393,14 @@ type AddressSpace interface {
 	AddressSpaceIO
 }
 
+// AddressSpaceForker is implemented by AddressSpaces whose platform state
+// must be explicitly copied when a guest address space is forked. The source
+// AddressSpace is protected by PreFork while ForkAddressSpaceFrom runs, and
+// the destination has not yet been exposed to a task.
+type AddressSpaceForker interface {
+	ForkAddressSpaceFrom(source AddressSpace) error
+}
+
 // AddressSpaceIO supports IO through the memory mappings installed in an
 // AddressSpace.
 //
@@ -439,6 +447,13 @@ type AddressSpaceIO interface {
 // tables owned by the host backend.
 type AddressSpaceIOAllSizes interface {
 	AddressSpaceIOAllSizes() bool
+}
+
+// AddressSpaceIOEnsureAccess is implemented by AddressSpaces that can fault in
+// and validate a user range without relying on the sentry's VMA/PMA metadata.
+// It returns the accessible prefix length.
+type AddressSpaceIOEnsureAccess interface {
+	EnsureAccess(addr hostarch.Addr, length uint64, at hostarch.AccessType) (uint64, error)
 }
 
 // AddressSpaceReservedRange is implemented by AddressSpaces that reserve a

@@ -180,7 +180,7 @@ restart:
 	if err != nil {
 		return nil, hostarch.NoAccess, err
 	}
-	if needPatch {
+	if needPatch && !s.hemiGvisorKeepSyscallUnpatched(ac.SyscallNo()) {
 		s.usertrap.PatchSyscall(ctx, ac, mm)
 	}
 	if !isSyscall && linux.Signal(c.signalInfo.Signo) == linux.SIGILL {

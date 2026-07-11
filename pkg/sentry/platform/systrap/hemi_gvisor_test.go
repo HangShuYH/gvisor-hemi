@@ -18,6 +18,7 @@ import (
 	"math"
 	"testing"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/hostarch"
 )
@@ -46,5 +47,22 @@ func TestHemiGvisorContainsUserMem(t *testing.T) {
 				t.Fatalf("hemiGvisorContainsUserMem(%#x, %#x) = %t, want %t", test.addr, test.length, got, test.want)
 			}
 		})
+	}
+}
+
+func TestHemiGvisorKeepSyscallUnpatched(t *testing.T) {
+	inactive := subprocess{}
+	if inactive.hemiGvisorKeepSyscallUnpatched(unix.SYS_MMAP) {
+		t.Fatal("inactive HEMI subprocess kept mmap unpatched")
+	}
+
+	active := subprocess{hemiGvisorUserMemTGID: 1}
+	for _, sysno := range []uintptr{unix.SYS_MMAP, unix.SYS_MUNMAP, unix.SYS_MPROTECT} {
+		if !active.hemiGvisorKeepSyscallUnpatched(sysno) {
+			t.Errorf("active HEMI subprocess allowed syscall %d to be patched", sysno)
+		}
+	}
+	if active.hemiGvisorKeepSyscallUnpatched(unix.SYS_READ) {
+		t.Fatal("active HEMI subprocess kept unrelated read syscall unpatched")
 	}
 }

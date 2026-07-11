@@ -184,6 +184,7 @@ go_test(
     size = "small",
     srcs = [
         "hemi_reservation_test.go",
+        "lifecycle_test.go",
         "mm_test.go",
     ],
     library = ":mm",

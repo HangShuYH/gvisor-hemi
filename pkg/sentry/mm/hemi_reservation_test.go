@@ -21,6 +21,7 @@ import (
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/contexttest"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/futex"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 )
 
@@ -101,5 +102,24 @@ func TestForceMMapCannotUseReservedRange(t *testing.T) {
 	})
 	if !linuxerr.Equals(linuxerr.ENOMEM, err) {
 		t.Fatalf("MMap() error = %v, want %v", err, linuxerr.ENOMEM)
+	}
+}
+
+func TestGetSharedFutexKeyInReservedRange(t *testing.T) {
+	ctx := contexttest.Context(t)
+	mm := MemoryManager{
+		reservedAR: hostarch.AddrRange{Start: 0x50000000, End: 0x50001000},
+	}
+	addr := mm.reservedAR.Start + 8
+
+	key, err := mm.GetSharedFutexKey(ctx, addr)
+	if err != nil {
+		t.Fatalf("GetSharedFutexKey() unexpected error: %v", err)
+	}
+	if key.Kind != futex.KindSharedPrivate {
+		t.Errorf("GetSharedFutexKey() kind = %v, want %v", key.Kind, futex.KindSharedPrivate)
+	}
+	if key.Offset != uint64(addr) {
+		t.Errorf("GetSharedFutexKey() offset = %#x, want %#x", key.Offset, addr)
 	}
 }

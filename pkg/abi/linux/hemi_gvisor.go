@@ -45,6 +45,33 @@ var (
 	HEMI_GVISOR_MAP_FILE = IOW(HEMI_GVISOR_IOCTL_TYPE, 0x01, uint32((*HemiGvisorMapFile)(nil).SizeBytes()))
 )
 
+// HemiGvisorResetMM is struct hemi_gvisor_reset_mm from
+// include/uapi/linux/hemi_gvisor.h.
+//
+// +marshal
+type HemiGvisorResetMM struct {
+	_          structs.HostLayout
+	TargetTGID int32
+	Flags      uint32
+}
+
+// HemiGvisorForkMM is struct hemi_gvisor_fork_mm from
+// include/uapi/linux/hemi_gvisor.h.
+//
+// +marshal
+type HemiGvisorForkMM struct {
+	_          structs.HostLayout
+	ParentTGID int32
+	ChildTGID  int32
+	Flags      uint32
+	Reserved   uint32
+}
+
+var (
+	HEMI_GVISOR_RESET_MM = IOW(HEMI_GVISOR_IOCTL_TYPE, 0x02, uint32((*HemiGvisorResetMM)(nil).SizeBytes()))
+	HEMI_GVISOR_FORK_MM  = IOW(HEMI_GVISOR_IOCTL_TYPE, 0x03, uint32((*HemiGvisorForkMM)(nil).SizeBytes()))
+)
+
 // HemiGvisorUserMem is struct hemi_gvisor_user_mem from
 // include/uapi/linux/hemi_gvisor.h.
 //
@@ -61,6 +88,55 @@ type HemiGvisorUserMem struct {
 var (
 	HEMI_GVISOR_READ_USER  = IOWR(HEMI_GVISOR_IOCTL_TYPE, 0x11, uint32((*HemiGvisorUserMem)(nil).SizeBytes()))
 	HEMI_GVISOR_WRITE_USER = IOWR(HEMI_GVISOR_IOCTL_TYPE, 0x12, uint32((*HemiGvisorUserMem)(nil).SizeBytes()))
+)
+
+const (
+	HEMI_GVISOR_ATOMIC_U32_LOAD    = 0
+	HEMI_GVISOR_ATOMIC_U32_SWAP    = 1
+	HEMI_GVISOR_ATOMIC_U32_CMPXCHG = 2
+)
+
+// HemiGvisorAtomicU32 is struct hemi_gvisor_atomic_u32 from
+// include/uapi/linux/hemi_gvisor.h.
+//
+// +marshal
+type HemiGvisorAtomicU32 struct {
+	_          structs.HostLayout
+	Addr       uint64
+	TargetTGID int32
+	Op         uint32
+	Old        uint32
+	New        uint32
+	Value      uint32
+	Flags      uint32
+}
+
+var (
+	HEMI_GVISOR_ATOMIC_U32 = IOWR(HEMI_GVISOR_IOCTL_TYPE, 0x13, uint32((*HemiGvisorAtomicU32)(nil).SizeBytes()))
+)
+
+const (
+	HEMI_GVISOR_USER_ACCESS_READ  = 1
+	HEMI_GVISOR_USER_ACCESS_WRITE = 2
+)
+
+// HemiGvisorProbeUser is struct hemi_gvisor_probe_user from
+// include/uapi/linux/hemi_gvisor.h.
+//
+// +marshal
+type HemiGvisorProbeUser struct {
+	_          structs.HostLayout
+	Addr       uint64
+	Len        uint64
+	Done       uint64
+	TargetTGID int32
+	Access     uint32
+	Result     int32
+	Flags      uint32
+}
+
+var (
+	HEMI_GVISOR_PROBE_USER = IOWR(HEMI_GVISOR_IOCTL_TYPE, 0x14, uint32((*HemiGvisorProbeUser)(nil).SizeBytes()))
 )
 
 const (

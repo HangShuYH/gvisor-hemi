@@ -375,6 +375,14 @@ func (mm *MemoryManager) EnsurePMAsExist(ctx context.Context, addr hostarch.Addr
 	if !ok {
 		return 0, linuxerr.EFAULT
 	}
+	if mm.asioEnabled(opts) {
+		if ensure, ok := mm.as.(platform.AddressSpaceIOEnsureAccess); ok {
+			n, err := ensure.EnsureAccess(ar.Start, uint64(ar.Length()), hostarch.Write)
+			if _, unavailable := err.(platform.AddressSpaceIOUnavailable); !unavailable {
+				return int64(n), translateIOError(ctx, err)
+			}
+		}
+	}
 	n64, err := mm.withInternalMappings(ctx, ar, hostarch.Write, opts.IgnorePermissions, func(ims safemem.BlockSeq) (uint64, error) {
 		return uint64(ims.NumBytes()), nil
 	})

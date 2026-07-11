@@ -116,12 +116,32 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 	unix.SYS_IOCTL: seccomp.Or{
 		seccomp.PerArg{
 			seccomp.NonNegativeFD{},
+			seccomp.EqualTo(linux.HEMI_GVISOR_RESET_MM),
+			seccomp.AnyValue{},
+		},
+		seccomp.PerArg{
+			seccomp.NonNegativeFD{},
+			seccomp.EqualTo(linux.HEMI_GVISOR_FORK_MM),
+			seccomp.AnyValue{},
+		},
+		seccomp.PerArg{
+			seccomp.NonNegativeFD{},
 			seccomp.EqualTo(linux.HEMI_GVISOR_READ_USER),
 			seccomp.AnyValue{},
 		},
 		seccomp.PerArg{
 			seccomp.NonNegativeFD{},
 			seccomp.EqualTo(linux.HEMI_GVISOR_WRITE_USER),
+			seccomp.AnyValue{},
+		},
+		seccomp.PerArg{
+			seccomp.NonNegativeFD{},
+			seccomp.EqualTo(linux.HEMI_GVISOR_ATOMIC_U32),
+			seccomp.AnyValue{},
+		},
+		seccomp.PerArg{
+			seccomp.NonNegativeFD{},
+			seccomp.EqualTo(linux.HEMI_GVISOR_PROBE_USER),
 			seccomp.AnyValue{},
 		},
 		// These commands are needed for host FD.

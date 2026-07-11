@@ -68,6 +68,12 @@ func (mm *MemoryManager) Fork(ctx context.Context) (*MemoryManager, error) {
 
 	mm.AddressSpace().PreFork()
 	defer mm.AddressSpace().PostFork()
+	if forker, ok := as.(platform.AddressSpaceForker); ok {
+		if err := forker.ForkAddressSpaceFrom(mm.AddressSpace()); err != nil {
+			as.Release()
+			return nil, err
+		}
+	}
 	mm.metadataMu.Lock()
 	defer mm.metadataMu.Unlock()
 
