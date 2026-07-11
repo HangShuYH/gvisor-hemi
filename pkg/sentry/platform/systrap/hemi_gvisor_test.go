@@ -1,0 +1,50 @@
+// Copyright 2026 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package systrap
+
+import (
+	"math"
+	"testing"
+
+	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/hostarch"
+)
+
+func TestHemiGvisorContainsUserMem(t *testing.T) {
+	tests := []struct {
+		name   string
+		addr   uint64
+		length uint64
+		want   bool
+	}{
+		{name: "empty below range", addr: 0, length: 0, want: true},
+		{name: "first byte", addr: linux.HEMI_GVISOR_VMAR_START, length: 1, want: true},
+		{name: "last byte", addr: linux.HEMI_GVISOR_VMAR_END - 1, length: 1, want: true},
+		{name: "entire range", addr: linux.HEMI_GVISOR_VMAR_START, length: linux.HEMI_GVISOR_VMAR_END - linux.HEMI_GVISOR_VMAR_START, want: true},
+		{name: "below range", addr: linux.HEMI_GVISOR_VMAR_START - 1, length: 1, want: false},
+		{name: "crosses start", addr: linux.HEMI_GVISOR_VMAR_START - 1, length: 2, want: false},
+		{name: "at end", addr: linux.HEMI_GVISOR_VMAR_END, length: 1, want: false},
+		{name: "crosses end", addr: linux.HEMI_GVISOR_VMAR_END - 1, length: 2, want: false},
+		{name: "overflow", addr: math.MaxUint64 - 1, length: 4, want: false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := hemiGvisorContainsUserMem(hostarch.Addr(test.addr), test.length); got != test.want {
+				t.Fatalf("hemiGvisorContainsUserMem(%#x, %#x) = %t, want %t", test.addr, test.length, got, test.want)
+			}
+		})
+	}
+}

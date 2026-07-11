@@ -344,7 +344,8 @@ func New(opts platform.Options) (*Systrap, error) {
 
 // SupportsAddressSpaceIO implements platform.Platform.SupportsAddressSpaceIO.
 func (*Systrap) SupportsAddressSpaceIO() bool {
-	return false
+	_, ok := hemiGvisorDeviceFD()
+	return ok
 }
 
 // MapUnit implements platform.Platform.MapUnit.
@@ -362,7 +363,15 @@ func (*Systrap) MaxUserAddress() hostarch.Addr {
 
 // NewAddressSpace returns a new subprocess.
 func (p *Systrap) NewAddressSpace() (platform.AddressSpace, error) {
-	return newSubprocess(globalPool.source.createStub, p.memoryFile, true)
+	s, err := newSubprocess(globalPool.source.createStub, p.memoryFile, true)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.hemiGvisorInitUserMem(); err != nil {
+		s.Release()
+		return nil, err
+	}
+	return s, nil
 }
 
 // NewContext returns an interruptible platformContext.

@@ -96,6 +96,16 @@ func (mm *MemoryManager) asioEnabled(opts usermem.IOOpts) bool {
 	return mm.haveASIO && !opts.IgnorePermissions
 }
 
+func (mm *MemoryManager) asioEnabledForSize(opts usermem.IOOpts, size, threshold uint64) bool {
+	if !mm.asioEnabled(opts) {
+		return false
+	}
+	if asio, ok := mm.as.(platform.AddressSpaceIOAllSizes); ok && asio.AddressSpaceIOAllSizes() {
+		return true
+	}
+	return size < threshold
+}
+
 // translateIOError converts errors to EFAULT, as is usually reported for all
 // I/O errors originating from MM in Linux.
 func translateIOError(ctx context.Context, err error) error {
@@ -120,7 +130,7 @@ func (mm *MemoryManager) CopyOut(ctx context.Context, addr hostarch.Addr, src []
 	}
 
 	// Do AddressSpace IO if applicable.
-	if mm.asioEnabled(opts) && len(src) < copyMapMinBytes {
+	if mm.asioEnabledForSize(opts, uint64(len(src)), copyMapMinBytes) {
 		return mm.asCopyOut(ctx, ar, src, opts)
 	}
 
@@ -175,7 +185,7 @@ func (mm *MemoryManager) CopyIn(ctx context.Context, addr hostarch.Addr, dst []b
 	}
 
 	// Do AddressSpace IO if applicable.
-	if mm.asioEnabled(opts) && len(dst) < copyMapMinBytes {
+	if mm.asioEnabledForSize(opts, uint64(len(dst)), copyMapMinBytes) {
 		return mm.asCopyIn(ctx, ar, dst, opts)
 	}
 
@@ -230,7 +240,7 @@ func (mm *MemoryManager) ZeroOut(ctx context.Context, addr hostarch.Addr, toZero
 	}
 
 	// Do AddressSpace IO if applicable.
-	if mm.asioEnabled(opts) && toZero < copyMapMinBytes {
+	if mm.asioEnabledForSize(opts, uint64(toZero), copyMapMinBytes) {
 		return mm.asZeroOut(ctx, ar, opts)
 	}
 
@@ -280,7 +290,7 @@ func (mm *MemoryManager) CopyOutFrom(ctx context.Context, ars hostarch.AddrRange
 	}
 
 	// Do AddressSpace IO if applicable.
-	if mm.asioEnabled(opts) && ars.NumBytes() < rwMapMinBytes {
+	if mm.asioEnabledForSize(opts, uint64(ars.NumBytes()), rwMapMinBytes) {
 		// We have to introduce a buffered copy, instead of just passing a
 		// safemem.BlockSeq representing addresses in the AddressSpace to src.
 		// This is because usermem.IO.CopyOutFrom() guarantees that it calls
@@ -327,7 +337,7 @@ func (mm *MemoryManager) CopyInTo(ctx context.Context, ars hostarch.AddrRangeSeq
 	}
 
 	// Do AddressSpace IO if applicable.
-	if mm.asioEnabled(opts) && ars.NumBytes() < rwMapMinBytes {
+	if mm.asioEnabledForSize(opts, uint64(ars.NumBytes()), rwMapMinBytes) {
 		buf := make([]byte, int(ars.NumBytes()))
 		var done int
 		var bufErr error

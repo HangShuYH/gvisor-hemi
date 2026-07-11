@@ -27,15 +27,19 @@ import (
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/hostsyscall"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
 const hemiGvisorDevicePath = "/dev/hemi_gvisor"
+
+const hemiGvisorUserMemMax = 16 * hostarch.PageSize
 
 var hemiGvisorDevice = struct {
 	sync.Mutex
@@ -79,6 +83,137 @@ func hemiGvisorDeviceFD() (int32, bool) {
 		return hemiGvisorDevice.fd, true
 	}
 	return -1, false
+}
+
+func (s *subprocess) hemiGvisorInitUserMem() error {
+	if _, ok := hemiGvisorDeviceFD(); !ok {
+		return nil
+	}
+
+	s.syscallThreadMu.Lock()
+	t := s.syscallThread
+	s.syscallThreadMu.Unlock()
+	if t == nil || t.thread == nil {
+		return fmt.Errorf("HEMI gVisor subprocess has no host thread")
+	}
+
+	s.hemiGvisorUserMemTGID = int32(t.thread.tgid)
+	return nil
+}
+
+func (s *subprocess) hemiGvisorReleaseUserMem() {
+	s.hemiGvisorUserMemTGID = 0
+}
+
+func hemiGvisorContainsUserMem(addr hostarch.Addr, length uint64) bool {
+	if length == 0 {
+		return true
+	}
+	start := uint64(addr)
+	end := start + length
+	return start >= linux.HEMI_GVISOR_VMAR_START &&
+		end >= start && end <= linux.HEMI_GVISOR_VMAR_END
+}
+
+func (s *subprocess) hemiGvisorUserMem(addr hostarch.Addr, data []byte, write bool) (int, error) {
+	if len(data) == 0 {
+		return 0, nil
+	}
+	if !hemiGvisorContainsUserMem(addr, uint64(len(data))) {
+		return 0, platform.AddressSpaceIOUnavailable{}
+	}
+	deviceFD, ok := hemiGvisorDeviceFD()
+	if !ok || s.hemiGvisorUserMemTGID <= 0 {
+		return 0, platform.AddressSpaceIOUnavailable{}
+	}
+
+	req := linux.HemiGvisorUserMem{
+		Addr:       uint64(addr),
+		Len:        uint64(len(data)),
+		UserBuf:    uint64(uintptr(unsafe.Pointer(&data[0]))),
+		TargetTGID: s.hemiGvisorUserMemTGID,
+	}
+	cmd := linux.HEMI_GVISOR_READ_USER
+	if write {
+		cmd = linux.HEMI_GVISOR_WRITE_USER
+	}
+	errno := hostsyscall.RawSyscallErrno6(
+		unix.SYS_IOCTL, uintptr(deviceFD), uintptr(cmd),
+		uintptr(unsafe.Pointer(&req)), 0, 0, 0)
+	if errno == 0 {
+		return len(data), nil
+	}
+	if errno == unix.EFAULT {
+		return 0, platform.SegmentationFault{Addr: addr}
+	}
+	return 0, fmt.Errorf("HEMI gVisor user memory ioctl: %w", errno)
+}
+
+// AddressSpaceIOAllSizes reports that HEMI owns the authoritative user page
+// tables, so Sentry internal mappings must not be selected based on size.
+func (s *subprocess) AddressSpaceIOAllSizes() bool {
+	return s.hemiGvisorUserMemTGID > 0
+}
+
+func (s *subprocess) CopyIn(addr hostarch.Addr, dst []byte) (int, error) {
+	if !hemiGvisorContainsUserMem(addr, uint64(len(dst))) {
+		return 0, platform.AddressSpaceIOUnavailable{}
+	}
+	var done int
+	for done < len(dst) {
+		end := min(done+hemiGvisorUserMemMax, len(dst))
+		n, err := s.hemiGvisorUserMem(addr+hostarch.Addr(done), dst[done:end], false)
+		done += n
+		if err != nil {
+			return done, err
+		}
+	}
+	return done, nil
+}
+
+func (s *subprocess) CopyOut(addr hostarch.Addr, src []byte) (int, error) {
+	if !hemiGvisorContainsUserMem(addr, uint64(len(src))) {
+		return 0, platform.AddressSpaceIOUnavailable{}
+	}
+	var done int
+	for done < len(src) {
+		end := min(done+hemiGvisorUserMemMax, len(src))
+		n, err := s.hemiGvisorUserMem(addr+hostarch.Addr(done), src[done:end], true)
+		done += n
+		if err != nil {
+			return done, err
+		}
+	}
+	return done, nil
+}
+
+func (s *subprocess) ZeroOut(addr hostarch.Addr, toZero uintptr) (uintptr, error) {
+	if !hemiGvisorContainsUserMem(addr, uint64(toZero)) {
+		return 0, platform.AddressSpaceIOUnavailable{}
+	}
+	zero := make([]byte, min(toZero, hostarch.PageSize))
+	var done uintptr
+	for done < toZero {
+		length := min(toZero-done, uintptr(len(zero)))
+		n, err := s.CopyOut(addr+hostarch.Addr(done), zero[:length])
+		done += uintptr(n)
+		if err != nil {
+			return done, err
+		}
+	}
+	return done, nil
+}
+
+func (s *subprocess) SwapUint32(addr hostarch.Addr, value uint32) (uint32, error) {
+	return 0, platform.AddressSpaceIOUnavailable{}
+}
+
+func (s *subprocess) CompareAndSwapUint32(addr hostarch.Addr, old, value uint32) (uint32, error) {
+	return 0, platform.AddressSpaceIOUnavailable{}
+}
+
+func (s *subprocess) LoadUint32(addr hostarch.Addr) (uint32, error) {
+	return 0, platform.AddressSpaceIOUnavailable{}
 }
 
 type hemiGvisorTask interface {

@@ -433,6 +433,14 @@ type AddressSpaceIO interface {
 	LoadUint32(addr hostarch.Addr) (uint32, error)
 }
 
+// AddressSpaceIOAllSizes is implemented by AddressSpaces that must service
+// user-memory copies through AddressSpaceIO regardless of copy size. This is
+// required when internal mappings cannot observe the authoritative page
+// tables owned by the host backend.
+type AddressSpaceIOAllSizes interface {
+	AddressSpaceIOAllSizes() bool
+}
+
 // NoAddressSpaceIO implements AddressSpaceIO methods by panicking.
 type NoAddressSpaceIO struct{}
 

@@ -162,6 +162,10 @@ type subprocess struct {
 	syscallThreadMu sync.Mutex
 	syscallThread   *syscallThread
 
+	// hemiGvisorUserMemTGID identifies this subprocess to user-memory ioctls
+	// issued through the HEMI device opened during platform initialization.
+	hemiGvisorUserMemTGID int32
+
 	// sysmsgThreadsMu protects sysmsgThreads
 	sysmsgThreadsMu sync.RWMutex
 	// sysmsgThreads is a collection of all active sysmsg threads in the
@@ -509,6 +513,7 @@ func (s *subprocess) unmap() {
 // globalPool. This has the added benefit of reducing creation time for new
 // subprocesses.
 func (s *subprocess) Release() {
+	s.hemiGvisorReleaseUserMem()
 	if !s.alive() {
 		return
 	}
