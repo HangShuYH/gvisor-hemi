@@ -220,6 +220,12 @@ func (s *subprocess) AddressSpaceIOAllSizes() bool {
 	return s.hemiGvisorTGID > 0
 }
 
+// AddressSpaceIOReadIgnoresPermissions reports that HEMI CopyIn reads through
+// HEMI's authoritative page tables and can service instruction-emulation reads.
+func (s *subprocess) AddressSpaceIOReadIgnoresPermissions() bool {
+	return s.hemiGvisorTGID > 0
+}
+
 // EnsureAccess faults in and validates a HEMI-managed user range without
 // consulting the sentry's VMA/PMA metadata.
 func (s *subprocess) EnsureAccess(addr hostarch.Addr, length uint64, at hostarch.AccessType) (uint64, error) {

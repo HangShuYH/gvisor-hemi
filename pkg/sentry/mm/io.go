@@ -106,6 +106,23 @@ func (mm *MemoryManager) asioEnabledForSize(opts usermem.IOOpts, size, threshold
 	return size < threshold
 }
 
+func (mm *MemoryManager) asioReadEnabledForSize(opts usermem.IOOpts, size, threshold uint64) bool {
+	if !opts.IgnorePermissions {
+		return mm.asioEnabledForSize(opts, size, threshold)
+	}
+	if !mm.haveASIO {
+		return false
+	}
+	asio, ok := mm.as.(platform.AddressSpaceIOReadIgnoresPermissions)
+	if !ok || !asio.AddressSpaceIOReadIgnoresPermissions() {
+		return false
+	}
+	if asio, ok := mm.as.(platform.AddressSpaceIOAllSizes); ok && asio.AddressSpaceIOAllSizes() {
+		return true
+	}
+	return size < threshold
+}
+
 // translateIOError converts errors to EFAULT, as is usually reported for all
 // I/O errors originating from MM in Linux.
 func translateIOError(ctx context.Context, err error) error {
@@ -185,7 +202,7 @@ func (mm *MemoryManager) CopyIn(ctx context.Context, addr hostarch.Addr, dst []b
 	}
 
 	// Do AddressSpace IO if applicable.
-	if mm.asioEnabledForSize(opts, uint64(len(dst)), copyMapMinBytes) {
+	if mm.asioReadEnabledForSize(opts, uint64(len(dst)), copyMapMinBytes) {
 		return mm.asCopyIn(ctx, ar, dst, opts)
 	}
 
@@ -337,7 +354,7 @@ func (mm *MemoryManager) CopyInTo(ctx context.Context, ars hostarch.AddrRangeSeq
 	}
 
 	// Do AddressSpace IO if applicable.
-	if mm.asioEnabledForSize(opts, uint64(ars.NumBytes()), rwMapMinBytes) {
+	if mm.asioReadEnabledForSize(opts, uint64(ars.NumBytes()), rwMapMinBytes) {
 		buf := make([]byte, int(ars.NumBytes()))
 		var done int
 		var bufErr error

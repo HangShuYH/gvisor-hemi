@@ -449,6 +449,15 @@ type AddressSpaceIOAllSizes interface {
 	AddressSpaceIOAllSizes() bool
 }
 
+// AddressSpaceIOReadIgnoresPermissions is implemented by AddressSpaces whose
+// CopyIn implementation can read application memory without enforcing the
+// application's mapping permissions. MemoryManager uses this for reads such as
+// instruction emulation, which must work even when IOOpts.IgnorePermissions is
+// set.
+type AddressSpaceIOReadIgnoresPermissions interface {
+	AddressSpaceIOReadIgnoresPermissions() bool
+}
+
 // AddressSpaceIOEnsureAccess is implemented by AddressSpaces that can fault in
 // and validate a user range without relying on the sentry's VMA/PMA metadata.
 // It returns the accessible prefix length.

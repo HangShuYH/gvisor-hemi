@@ -41,10 +41,13 @@ func (p *forkTrackingPlatform) NewAddressSpace() (platform.AddressSpace, error) 
 
 type forkTrackingAddressSpace struct {
 	platform.AddressSpace
-	forkSource   platform.AddressSpace
-	ensureAddr   hostarch.Addr
-	ensureLength uint64
-	ensureAccess hostarch.AccessType
+	forkSource            platform.AddressSpace
+	ensureAddr            hostarch.Addr
+	ensureLength          uint64
+	ensureAccess          hostarch.AccessType
+	ignorePermissionsRead bool
+	copyInCalls           int
+	copyInData            []byte
 }
 
 func (as *forkTrackingAddressSpace) ForkAddressSpaceFrom(source platform.AddressSpace) error {
@@ -57,6 +60,15 @@ func (as *forkTrackingAddressSpace) EnsureAccess(addr hostarch.Addr, length uint
 	as.ensureLength = length
 	as.ensureAccess = at
 	return length, nil
+}
+
+func (as *forkTrackingAddressSpace) AddressSpaceIOReadIgnoresPermissions() bool {
+	return as.ignorePermissionsRead
+}
+
+func (as *forkTrackingAddressSpace) CopyIn(addr hostarch.Addr, dst []byte) (int, error) {
+	as.copyInCalls++
+	return copy(dst, as.copyInData), nil
 }
 
 func TestForkCopiesPlatformAddressSpaceState(t *testing.T) {
@@ -107,5 +119,34 @@ func TestEnsurePMAsExistUsesPlatformAccessCheck(t *testing.T) {
 		t.Fatalf("EnsureAccess(%#x, %d, %v), want (%#x, %d, %v)",
 			as.ensureAddr, as.ensureLength, as.ensureAccess,
 			addr, length, hostarch.Write)
+	}
+}
+
+func TestCopyInIgnorePermissionsUsesCapableAddressSpace(t *testing.T) {
+	ctx := contexttest.Context(t)
+	p := &forkTrackingPlatform{Platform: platform.FromContext(ctx)}
+	mm, err := NewMemoryManager(p, pgalloc.MemoryFileFromContext(ctx))
+	if err != nil {
+		t.Fatalf("NewMemoryManager: %v", err)
+	}
+	defer mm.DecUsers(ctx)
+
+	mm.haveASIO = true
+	mm.layout.MaxAddr = p.MaxUserAddress()
+	as := p.addressSpaces[0]
+	as.ignorePermissionsRead = true
+	as.copyInData = []byte{0x0f, 0xa2}
+
+	got := make([]byte, len(as.copyInData))
+	if n, err := mm.CopyIn(ctx, p.MinUserAddress(), got, usermem.IOOpts{IgnorePermissions: true}); err != nil {
+		t.Fatalf("CopyIn: %v", err)
+	} else if n != len(got) {
+		t.Fatalf("CopyIn copied %d bytes, want %d", n, len(got))
+	}
+	if as.copyInCalls != 1 {
+		t.Fatalf("AddressSpace.CopyIn called %d times, want 1", as.copyInCalls)
+	}
+	if got[0] != 0x0f || got[1] != 0xa2 {
+		t.Fatalf("CopyIn returned %x, want 0fa2", got)
 	}
 }
