@@ -162,8 +162,12 @@ type subprocess struct {
 	syscallThreadMu sync.Mutex
 	syscallThread   *syscallThread
 
-	// hemiGvisorTGID identifies this subprocess to HEMI ioctls.
+	// hemiGvisorTGID identifies this subprocess during initial HEMI binding and
+	// marks it active while the AddressSpace is checked out of the pool.
 	hemiGvisorTGID int32
+	// hemiGvisorMMHandle is the stable Host handle returned when this
+	// subprocess is first attached to HEMI. It remains valid across pool resets.
+	hemiGvisorMMHandle uint64
 
 	// sysmsgThreadsMu protects sysmsgThreads
 	sysmsgThreadsMu sync.RWMutex

@@ -53,6 +53,7 @@ type HemiGvisorResetMM struct {
 	_          structs.HostLayout
 	TargetTGID int32
 	Flags      uint32
+	MMHandle   uint64
 }
 
 // HemiGvisorForkMM is struct hemi_gvisor_fork_mm from
@@ -60,15 +61,15 @@ type HemiGvisorResetMM struct {
 //
 // +marshal
 type HemiGvisorForkMM struct {
-	_          structs.HostLayout
-	ParentTGID int32
-	ChildTGID  int32
-	Flags      uint32
-	Reserved   uint32
+	_              structs.HostLayout
+	ParentMMHandle uint64
+	ChildMMHandle  uint64
+	Flags          uint32
+	Reserved       uint32
 }
 
 var (
-	HEMI_GVISOR_RESET_MM = IOW(HEMI_GVISOR_IOCTL_TYPE, 0x02, uint32((*HemiGvisorResetMM)(nil).SizeBytes()))
+	HEMI_GVISOR_RESET_MM = IOWR(HEMI_GVISOR_IOCTL_TYPE, 0x02, uint32((*HemiGvisorResetMM)(nil).SizeBytes()))
 	HEMI_GVISOR_FORK_MM  = IOW(HEMI_GVISOR_IOCTL_TYPE, 0x03, uint32((*HemiGvisorForkMM)(nil).SizeBytes()))
 )
 
@@ -77,12 +78,14 @@ var (
 //
 // +marshal
 type HemiGvisorUserMem struct {
-	_          structs.HostLayout
-	Addr       uint64
-	Len        uint64
-	UserBuf    uint64
-	TargetTGID int32
-	Flags      uint32
+	_        structs.HostLayout
+	Addr     uint64
+	Len      uint64
+	UserBuf  uint64
+	MMHandle uint64
+	Done     uint64
+	Result   int32
+	Flags    uint32
 }
 
 var (
@@ -101,14 +104,15 @@ const (
 //
 // +marshal
 type HemiGvisorAtomicU32 struct {
-	_          structs.HostLayout
-	Addr       uint64
-	TargetTGID int32
-	Op         uint32
-	Old        uint32
-	New        uint32
-	Value      uint32
-	Flags      uint32
+	_        structs.HostLayout
+	Addr     uint64
+	MMHandle uint64
+	Op       uint32
+	Old      uint32
+	New      uint32
+	Value    uint32
+	Flags    uint32
+	Reserved uint32
 }
 
 var (
@@ -125,14 +129,15 @@ const (
 //
 // +marshal
 type HemiGvisorProbeUser struct {
-	_          structs.HostLayout
-	Addr       uint64
-	Len        uint64
-	Done       uint64
-	TargetTGID int32
-	Access     uint32
-	Result     int32
-	Flags      uint32
+	_        structs.HostLayout
+	Addr     uint64
+	Len      uint64
+	Done     uint64
+	MMHandle uint64
+	Access   uint32
+	Result   int32
+	Flags    uint32
+	Reserved uint32
 }
 
 var (

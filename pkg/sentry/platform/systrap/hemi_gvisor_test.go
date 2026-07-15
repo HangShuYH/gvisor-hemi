@@ -21,6 +21,7 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/sentry/platform"
 )
 
 func TestHemiGvisorContainsUserMem(t *testing.T) {
@@ -52,7 +53,7 @@ func TestHemiGvisorContainsUserMem(t *testing.T) {
 
 func TestHemiGvisorKeepSyscallUnpatched(t *testing.T) {
 	inactive := subprocess{}
-	active := subprocess{hemiGvisorTGID: 1}
+	active := subprocess{hemiGvisorTGID: 1, hemiGvisorMMHandle: 1}
 	for _, sysno := range []uintptr{
 		unix.SYS_MMAP,
 		unix.SYS_MUNMAP,
@@ -75,5 +76,26 @@ func TestHemiGvisorKeepSyscallUnpatched(t *testing.T) {
 		if active.hemiGvisorKeepSyscallUnpatched(sysno) {
 			t.Errorf("active HEMI subprocess kept non-memory syscall %d unpatched", sysno)
 		}
+	}
+}
+
+func TestHemiGvisorUserMemResult(t *testing.T) {
+	const addr = hostarch.Addr(linux.HEMI_GVISOR_VMAR_START)
+
+	if done, err := hemiGvisorUserMemResult(addr, 8192, 8192, 0); err != nil || done != 8192 {
+		t.Fatalf("full result = (%d, %v), want (8192, nil)", done, err)
+	}
+	if done, err := hemiGvisorUserMemResult(addr, 8192, 4096, 0); err == nil || done != 4096 {
+		t.Fatalf("short success = (%d, %v), want (4096, error)", done, err)
+	}
+	if done, err := hemiGvisorUserMemResult(addr, 8192, 4096, -int32(unix.EFAULT)); done != 4096 {
+		t.Fatalf("partial fault progress = %d, want 4096", done)
+	} else if fault, ok := err.(platform.SegmentationFault); !ok {
+		t.Fatalf("partial fault error = %T(%v), want platform.SegmentationFault", err, err)
+	} else if want := addr + 4096; fault.Addr != want {
+		t.Fatalf("partial fault address = %#x, want %#x", fault.Addr, want)
+	}
+	if done, err := hemiGvisorUserMemResult(addr, 8192, 8193, 0); err == nil || done != 0 {
+		t.Fatalf("invalid progress = (%d, %v), want (0, error)", done, err)
 	}
 }
