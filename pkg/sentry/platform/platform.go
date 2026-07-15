@@ -458,6 +458,14 @@ type AddressSpaceIOReadIgnoresPermissions interface {
 	AddressSpaceIOReadIgnoresPermissions() bool
 }
 
+// AddressSpaceIOBatchSizer is implemented by AddressSpaces that can process
+// iterative AddressSpaceIO more efficiently with a larger reusable buffer.
+// Values at or below the MemoryManager default leave the default unchanged;
+// MemoryManager may clamp larger values to a bounded maximum.
+type AddressSpaceIOBatchSizer interface {
+	AddressSpaceIOBatchSize() int
+}
+
 // AddressSpaceIOEnsureAccess is implemented by AddressSpaces that can fault in
 // and validate a user range without relying on the sentry's VMA/PMA metadata.
 // It returns the accessible prefix length.

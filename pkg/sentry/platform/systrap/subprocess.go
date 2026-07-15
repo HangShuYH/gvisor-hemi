@@ -168,6 +168,15 @@ type subprocess struct {
 	// hemiGvisorMMHandle is the stable Host handle returned when this
 	// subprocess is first attached to HEMI. It remains valid across pool resets.
 	hemiGvisorMMHandle uint64
+	// hemiGvisorPortalMu serializes HEMI address-space lifecycle operations
+	// with user-memory, probe, and atomic portal operations. This matches the
+	// Host's per-mm serialization and ensures that a pooled address space can't
+	// be reset while a portal request is in flight.
+	hemiGvisorPortalMu sync.Mutex
+	// hemiGvisorDevice is the device instance to which hemiGvisorMMHandle
+	// belongs. It persists while an address space is pooled so that a handle is
+	// never reused against a replacement device instance.
+	hemiGvisorDevice *hemiGvisorDeviceState
 
 	// sysmsgThreadsMu protects sysmsgThreads
 	sysmsgThreadsMu sync.RWMutex

@@ -28,6 +28,7 @@ import (
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/hostsyscall"
+	"gvisor.dev/gvisor/pkg/memutil"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
@@ -40,13 +41,53 @@ const hemiGvisorDevicePath = "/dev/hemi_gvisor"
 
 const hemiGvisorUserMemMax = 16 * hostarch.PageSize
 
+const (
+	hemiGvisorRingLaneCount        = 4
+	hemiGvisorRingEntries          = 8
+	hemiGvisorRingHeaderSize       = 64
+	hemiGvisorRingDescriptorOffset = hemiGvisorRingHeaderSize
+	hemiGvisorRingDescriptorSize   = 64
+	hemiGvisorRingDataOffset       = hostarch.PageSize
+	hemiGvisorRingDataStride       = 16 * hostarch.PageSize
+	hemiGvisorRingSlotBytes        = hemiGvisorRingDataStride
+	hemiGvisorRingMapSize          = hemiGvisorRingDataOffset + hemiGvisorRingEntries*hemiGvisorRingDataStride
+	hemiGvisorRingBatchBytes       = hemiGvisorRingEntries * hemiGvisorRingSlotBytes
+)
+
+var hemiGvisorZeroBuffer [hemiGvisorRingBatchBytes]byte
+
+type hemiGvisorRingEnterFunc func(int32, *linux.HemiGvisorRingEnter) unix.Errno
+
+// hemiGvisorRingEnterError reports an ENTER ioctl rejected before the kernel
+// processed any descriptor in the submitted batch. Previously completed
+// batches remain reflected in the progress returned alongside this error.
+type hemiGvisorRingEnterError struct {
+	errno unix.Errno
+}
+
+func (e *hemiGvisorRingEnterError) Error() string {
+	return fmt.Sprintf("HEMI gVisor ring enter: %v", e.errno)
+}
+
+func (e *hemiGvisorRingEnterError) Unwrap() error {
+	return e.errno
+}
+
+type hemiGvisorRingLane struct {
+	ringID  uint64
+	mapping []byte
+}
+
+type hemiGvisorDeviceState struct {
+	file  *fd.FD
+	fd    int32
+	lanes chan *hemiGvisorRingLane
+}
+
 var hemiGvisorDevice = struct {
 	sync.Mutex
-	file *fd.FD
-	fd   int32
-}{
-	fd: -1,
-}
+	state *hemiGvisorDeviceState
+}{}
 
 func hemiGvisorOpenDevice(devicePath string) (*fd.FD, error) {
 	if devicePath == "" {
@@ -66,26 +107,187 @@ func hemiGvisorSetDeviceFD(deviceFile *fd.FD) {
 	if deviceFile == nil {
 		return
 	}
+	state := &hemiGvisorDeviceState{
+		file: deviceFile,
+		fd:   int32(deviceFile.FD()),
+	}
+	state.lanes = hemiGvisorSetupRingLanes(state.fd)
 
 	hemiGvisorDevice.Lock()
 	defer hemiGvisorDevice.Unlock()
 
-	hemiGvisorDevice.file = deviceFile
-	hemiGvisorDevice.fd = int32(deviceFile.FD())
+	hemiGvisorDevice.state = state
+}
+
+func hemiGvisorCurrentDevice() *hemiGvisorDeviceState {
+	hemiGvisorDevice.Lock()
+	defer hemiGvisorDevice.Unlock()
+	return hemiGvisorDevice.state
 }
 
 func hemiGvisorDeviceFD() (int32, bool) {
-	hemiGvisorDevice.Lock()
-	defer hemiGvisorDevice.Unlock()
-
-	if hemiGvisorDevice.fd >= 0 {
-		return hemiGvisorDevice.fd, true
+	state := hemiGvisorCurrentDevice()
+	if state != nil && state.fd >= 0 {
+		return state.fd, true
 	}
 	return -1, false
 }
 
+func hemiGvisorSetupRingLanes(deviceFD int32) chan *hemiGvisorRingLane {
+	lanes := make([]*hemiGvisorRingLane, 0, hemiGvisorRingLaneCount)
+	for range hemiGvisorRingLaneCount {
+		lane, err := hemiGvisorSetupRingLane(deviceFD)
+		if err != nil {
+			for _, lane := range lanes {
+				_ = memutil.UnmapSlice(lane.mapping)
+			}
+			return nil
+		}
+		lanes = append(lanes, lane)
+	}
+
+	available := make(chan *hemiGvisorRingLane, len(lanes))
+	for _, lane := range lanes {
+		available <- lane
+	}
+	return available
+}
+
+func hemiGvisorSetupRingLane(deviceFD int32) (*hemiGvisorRingLane, error) {
+	setup := linux.HemiGvisorRingSetup{ABIVersion: linux.HEMI_GVISOR_RING_ABI}
+	errno := hostsyscall.RawSyscallErrno6(
+		unix.SYS_IOCTL, uintptr(deviceFD), uintptr(linux.HEMI_GVISOR_SETUP_RING),
+		uintptr(unsafe.Pointer(&setup)), 0, 0, 0)
+	if errno != 0 {
+		return nil, errno
+	}
+	if setup.ABIVersion != linux.HEMI_GVISOR_RING_ABI || setup.Flags != 0 ||
+		setup.RingID == 0 || setup.Entries != hemiGvisorRingEntries ||
+		setup.DescriptorOffset != hemiGvisorRingDescriptorOffset ||
+		setup.DescriptorSize != hemiGvisorRingDescriptorSize ||
+		setup.DataOffset != hemiGvisorRingDataOffset ||
+		setup.DataStride != hemiGvisorRingDataStride ||
+		setup.MaxBytes != hemiGvisorRingBatchBytes ||
+		setup.MmapSize != hemiGvisorRingMapSize ||
+		setup.MmapOffset%uint64(hostarch.PageSize) != 0 ||
+		uint64(uintptr(setup.MmapOffset)) != setup.MmapOffset ||
+		uint64(uintptr(setup.MmapSize)) != setup.MmapSize {
+		return nil, fmt.Errorf("unsupported HEMI gVisor ring geometry: %+v", setup)
+	}
+
+	mapping, err := memutil.MapSlice(
+		0, uintptr(setup.MmapSize), unix.PROT_READ|unix.PROT_WRITE,
+		unix.MAP_SHARED, uintptr(uint32(deviceFD)), uintptr(setup.MmapOffset))
+	if err != nil {
+		return nil, err
+	}
+	header := (*linux.HemiGvisorRingHeader)(unsafe.Pointer(&mapping[0]))
+	if header.Magic != linux.HEMI_GVISOR_RING_MAGIC ||
+		header.ABIVersion != linux.HEMI_GVISOR_RING_ABI ||
+		header.HeaderSize != hemiGvisorRingHeaderSize ||
+		header.RingID != setup.RingID || header.Entries != setup.Entries ||
+		header.DescriptorOffset != setup.DescriptorOffset ||
+		header.DescriptorSize != setup.DescriptorSize ||
+		header.DataOffset != setup.DataOffset ||
+		header.DataStride != setup.DataStride ||
+		header.MaxBytes != setup.MaxBytes || header.Features != setup.Features ||
+		header.Reserved != 0 {
+		_ = memutil.UnmapSlice(mapping)
+		return nil, fmt.Errorf("HEMI gVisor ring header does not match setup: header=%+v setup=%+v", *header, setup)
+	}
+	return &hemiGvisorRingLane{ringID: setup.RingID, mapping: mapping}, nil
+}
+
+func hemiGvisorRawRingEnter(deviceFD int32, enter *linux.HemiGvisorRingEnter) unix.Errno {
+	return hostsyscall.RawSyscallErrno6(
+		unix.SYS_IOCTL, uintptr(deviceFD), uintptr(linux.HEMI_GVISOR_ENTER_RING),
+		uintptr(unsafe.Pointer(enter)), 0, 0, 0)
+}
+
+func (l *hemiGvisorRingLane) descriptor(index int) *linux.HemiGvisorRingDescriptor {
+	offset := hemiGvisorRingDescriptorOffset + index*hemiGvisorRingDescriptorSize
+	return (*linux.HemiGvisorRingDescriptor)(unsafe.Pointer(&l.mapping[offset]))
+}
+
+func (l *hemiGvisorRingLane) data(index, length int) []byte {
+	offset := hemiGvisorRingDataOffset + index*hemiGvisorRingDataStride
+	return l.mapping[offset : offset+length]
+}
+
+func (l *hemiGvisorRingLane) transfer(deviceFD int32, mmHandle uint64, addr hostarch.Addr, data []byte, op uint16, enterFn hemiGvisorRingEnterFunc) (int, error) {
+	var done int
+	for done < len(data) {
+		batchLen := min(len(data)-done, hemiGvisorRingBatchBytes)
+		count := (batchLen + hemiGvisorRingSlotBytes - 1) / hemiGvisorRingSlotBytes
+		batchAddr := addr + hostarch.Addr(done)
+
+		var described int
+		for i := 0; i < count; i++ {
+			length := min(batchLen-described, hemiGvisorRingSlotBytes)
+			*l.descriptor(i) = linux.HemiGvisorRingDescriptor{
+				Addr: uint64(batchAddr + hostarch.Addr(described)),
+				Len:  uint32(length),
+				Op:   op,
+			}
+			if op == linux.HEMI_GVISOR_RING_OP_WRITE {
+				copy(l.data(i, length), data[done+described:done+described+length])
+			}
+			described += length
+		}
+
+		enter := linux.HemiGvisorRingEnter{
+			RingID:   l.ringID,
+			MMHandle: mmHandle,
+			Count:    uint32(count),
+		}
+		if errno := enterFn(deviceFD, &enter); errno != 0 {
+			// The ENTER ABI guarantees that an ioctl error is returned before
+			// processing this batch, so callers may retry only its suffix via
+			// the legacy portal.
+			return done, &hemiGvisorRingEnterError{errno: errno}
+		}
+
+		var completed int
+		for i := 0; i < count; i++ {
+			length := min(batchLen-completed, hemiGvisorRingSlotBytes)
+			descriptor := l.descriptor(i)
+			expectedAddr := batchAddr + hostarch.Addr(completed)
+			if descriptor.Addr != uint64(expectedAddr) || descriptor.Len != uint32(length) ||
+				descriptor.Op != op || descriptor.Flags != 0 || descriptor.Done > uint32(length) ||
+				descriptor.Result > 0 || descriptor.Reserved != [5]uint64{} {
+				return done + completed, fmt.Errorf("HEMI gVisor ring returned an invalid descriptor %d: %+v", i, *descriptor)
+			}
+			n, err := hemiGvisorUserMemResult(expectedAddr, length, uint64(descriptor.Done), descriptor.Result)
+			if op == linux.HEMI_GVISOR_RING_OP_READ && n != 0 {
+				copy(data[done+completed:done+completed+n], l.data(i, n))
+			}
+			completed += n
+			if err != nil {
+				return done + completed, err
+			}
+		}
+		done += completed
+	}
+	return done, nil
+}
+
+func (d *hemiGvisorDeviceState) tryRingTransfer(mmHandle uint64, addr hostarch.Addr, data []byte, op uint16) (int, error, bool) {
+	if d == nil || d.lanes == nil {
+		return 0, nil, false
+	}
+	select {
+	case lane := <-d.lanes:
+		n, err := lane.transfer(d.fd, mmHandle, addr, data, op, hemiGvisorRawRingEnter)
+		d.lanes <- lane
+		return n, err, true
+	default:
+		return 0, nil, false
+	}
+}
+
 func (s *subprocess) hemiGvisorInitAddressSpace() error {
-	if _, ok := hemiGvisorDeviceFD(); !ok {
+	device := hemiGvisorCurrentDevice()
+	if device == nil {
 		return nil
 	}
 
@@ -96,17 +298,32 @@ func (s *subprocess) hemiGvisorInitAddressSpace() error {
 		return fmt.Errorf("HEMI gVisor subprocess has no host thread")
 	}
 
+	s.hemiGvisorPortalMu.Lock()
+	defer s.hemiGvisorPortalMu.Unlock()
+	if s.hemiGvisorMMHandle != 0 && s.hemiGvisorDevice != nil && s.hemiGvisorDevice != device {
+		return fmt.Errorf("HEMI gVisor mm handle %d belongs to a different device instance", s.hemiGvisorMMHandle)
+	}
+	s.hemiGvisorDevice = device
 	s.hemiGvisorTGID = int32(t.thread.tgid)
-	return s.hemiGvisorResetMM()
+	if err := s.hemiGvisorResetMMLocked(); err != nil {
+		s.hemiGvisorTGID = 0
+		return err
+	}
+	return nil
 }
 
 func (s *subprocess) hemiGvisorReleaseAddressSpace() {
+	s.hemiGvisorPortalMu.Lock()
+	defer s.hemiGvisorPortalMu.Unlock()
 	s.hemiGvisorTGID = 0
 }
 
-func (s *subprocess) hemiGvisorResetMM() error {
-	deviceFD, ok := hemiGvisorDeviceFD()
-	if !ok {
+// hemiGvisorResetMMLocked resets s's Host-managed address-space state.
+//
+// Preconditions: s.hemiGvisorPortalMu is locked.
+func (s *subprocess) hemiGvisorResetMMLocked() error {
+	device := s.hemiGvisorDevice
+	if device == nil {
 		return nil
 	}
 	if s.hemiGvisorTGID <= 0 {
@@ -118,7 +335,7 @@ func (s *subprocess) hemiGvisorResetMM() error {
 		req.TargetTGID = s.hemiGvisorTGID
 	}
 	errno := hostsyscall.RawSyscallErrno6(
-		unix.SYS_IOCTL, uintptr(deviceFD), uintptr(linux.HEMI_GVISOR_RESET_MM),
+		unix.SYS_IOCTL, uintptr(device.fd), uintptr(linux.HEMI_GVISOR_RESET_MM),
 		uintptr(unsafe.Pointer(&req)), 0, 0, 0)
 	if errno != 0 {
 		return fmt.Errorf("HEMI gVisor reset mm ioctl for tgid %d: %w",
@@ -134,13 +351,18 @@ func (s *subprocess) hemiGvisorResetMM() error {
 // ForkAddressSpaceFrom implements platform.AddressSpaceForker. It replaces
 // this subprocess's empty or pooled HEMI state with a COW fork of source.
 func (s *subprocess) ForkAddressSpaceFrom(source platform.AddressSpace) error {
-	deviceFD, ok := hemiGvisorDeviceFD()
-	if !ok {
-		return nil
-	}
 	parent, ok := source.(*subprocess)
 	if !ok {
 		return fmt.Errorf("HEMI gVisor fork source has type %T", source)
+	}
+	unlock := hemiGvisorLockForkPortals(parent, s)
+	defer unlock()
+
+	if parent.hemiGvisorDevice == nil && s.hemiGvisorDevice == nil {
+		return nil
+	}
+	if parent.hemiGvisorDevice == nil || parent.hemiGvisorDevice != s.hemiGvisorDevice {
+		return fmt.Errorf("HEMI gVisor fork uses different parent and child devices")
 	}
 	if !parent.hemiGvisorActive() || !s.hemiGvisorActive() {
 		return fmt.Errorf("HEMI gVisor fork has invalid parent/child handle %d/%d",
@@ -152,13 +374,32 @@ func (s *subprocess) ForkAddressSpaceFrom(source platform.AddressSpace) error {
 		ChildMMHandle:  s.hemiGvisorMMHandle,
 	}
 	errno := hostsyscall.RawSyscallErrno6(
-		unix.SYS_IOCTL, uintptr(deviceFD), uintptr(linux.HEMI_GVISOR_FORK_MM),
+		unix.SYS_IOCTL, uintptr(s.hemiGvisorDevice.fd), uintptr(linux.HEMI_GVISOR_FORK_MM),
 		uintptr(unsafe.Pointer(&req)), 0, 0, 0)
 	if errno != 0 {
 		return fmt.Errorf("HEMI gVisor fork mm ioctl for parent/child handle %d/%d: %w",
 			parent.hemiGvisorMMHandle, s.hemiGvisorMMHandle, errno)
 	}
 	return nil
+}
+
+func hemiGvisorLockForkPortals(parent, child *subprocess) func() {
+	if parent == child {
+		parent.hemiGvisorPortalMu.Lock()
+		return parent.hemiGvisorPortalMu.Unlock
+	}
+	first, second := parent, child
+	if first.hemiGvisorMMHandle > second.hemiGvisorMMHandle ||
+		(first.hemiGvisorMMHandle == second.hemiGvisorMMHandle &&
+			uintptr(unsafe.Pointer(first)) > uintptr(unsafe.Pointer(second))) {
+		first, second = second, first
+	}
+	first.hemiGvisorPortalMu.Lock()
+	second.hemiGvisorPortalMu.Lock()
+	return func() {
+		second.hemiGvisorPortalMu.Unlock()
+		first.hemiGvisorPortalMu.Unlock()
+	}
 }
 
 // hemiGvisorKeepSyscallUnpatched reports whether sysno must continue entering
@@ -199,8 +440,8 @@ func (s *subprocess) hemiGvisorUserMem(addr hostarch.Addr, data []byte, write bo
 	if !hemiGvisorContainsUserMem(addr, uint64(len(data))) {
 		return 0, platform.AddressSpaceIOUnavailable{}
 	}
-	deviceFD, ok := hemiGvisorDeviceFD()
-	if !ok || !s.hemiGvisorActive() {
+	device := s.hemiGvisorDevice
+	if device == nil || !s.hemiGvisorActive() {
 		return 0, platform.AddressSpaceIOUnavailable{}
 	}
 
@@ -215,8 +456,9 @@ func (s *subprocess) hemiGvisorUserMem(addr hostarch.Addr, data []byte, write bo
 		cmd = linux.HEMI_GVISOR_WRITE_USER
 	}
 	errno := hostsyscall.RawSyscallErrno6(
-		unix.SYS_IOCTL, uintptr(deviceFD), uintptr(cmd),
+		unix.SYS_IOCTL, uintptr(device.fd), uintptr(cmd),
 		uintptr(unsafe.Pointer(&req)), 0, 0, 0)
+	runtime.KeepAlive(data)
 	if errno != 0 {
 		if errno == unix.EFAULT {
 			return 0, platform.SegmentationFault{Addr: addr}
@@ -256,14 +498,28 @@ func (s *subprocess) AddressSpaceIOReadIgnoresPermissions() bool {
 	return s.hemiGvisorActive()
 }
 
+// AddressSpaceIOBatchSize returns one full ring batch only when this address
+// space has a usable ring. Legacy AddressSpaceIO retains MemoryManager's
+// smaller default buffer.
+func (s *subprocess) AddressSpaceIOBatchSize() int {
+	s.hemiGvisorPortalMu.Lock()
+	defer s.hemiGvisorPortalMu.Unlock()
+	if s.hemiGvisorActive() && s.hemiGvisorDevice != nil && s.hemiGvisorDevice.lanes != nil {
+		return hemiGvisorRingBatchBytes
+	}
+	return 0
+}
+
 // EnsureAccess faults in and validates a HEMI-managed user range without
 // consulting the sentry's VMA/PMA metadata.
 func (s *subprocess) EnsureAccess(addr hostarch.Addr, length uint64, at hostarch.AccessType) (uint64, error) {
 	if !hemiGvisorContainsUserMem(addr, length) {
 		return 0, platform.AddressSpaceIOUnavailable{}
 	}
-	deviceFD, ok := hemiGvisorDeviceFD()
-	if !ok || !s.hemiGvisorActive() {
+	s.hemiGvisorPortalMu.Lock()
+	defer s.hemiGvisorPortalMu.Unlock()
+	device := s.hemiGvisorDevice
+	if device == nil || !s.hemiGvisorActive() {
 		return 0, platform.AddressSpaceIOUnavailable{}
 	}
 
@@ -285,7 +541,7 @@ func (s *subprocess) EnsureAccess(addr hostarch.Addr, length uint64, at hostarch
 		Access:   access,
 	}
 	errno := hostsyscall.RawSyscallErrno6(
-		unix.SYS_IOCTL, uintptr(deviceFD), uintptr(linux.HEMI_GVISOR_PROBE_USER),
+		unix.SYS_IOCTL, uintptr(device.fd), uintptr(linux.HEMI_GVISOR_PROBE_USER),
 		uintptr(unsafe.Pointer(&req)), 0, 0, 0)
 	if errno != 0 {
 		return req.Done, fmt.Errorf("HEMI gVisor probe user ioctl: %w", errno)
@@ -311,7 +567,29 @@ func (s *subprocess) CopyIn(addr hostarch.Addr, dst []byte) (int, error) {
 	if !hemiGvisorContainsUserMem(addr, uint64(len(dst))) {
 		return 0, platform.AddressSpaceIOUnavailable{}
 	}
+	if len(dst) == 0 {
+		return 0, nil
+	}
+	s.hemiGvisorPortalMu.Lock()
+	defer s.hemiGvisorPortalMu.Unlock()
+	return s.hemiGvisorCopyInLocked(addr, dst)
+}
+
+// hemiGvisorCopyInLocked copies target memory into dst.
+//
+// Preconditions: s.hemiGvisorPortalMu is locked.
+func (s *subprocess) hemiGvisorCopyInLocked(addr hostarch.Addr, dst []byte) (int, error) {
 	var done int
+	if device := s.hemiGvisorDevice; device != nil && s.hemiGvisorActive() {
+		if n, err, ok := device.tryRingTransfer(
+			s.hemiGvisorMMHandle, addr, dst, linux.HEMI_GVISOR_RING_OP_READ); ok {
+			done = n
+			var enterErr *hemiGvisorRingEnterError
+			if err == nil || !errors.As(err, &enterErr) {
+				return n, err
+			}
+		}
+	}
 	for done < len(dst) {
 		end := min(done+hemiGvisorUserMemMax, len(dst))
 		n, err := s.hemiGvisorUserMem(addr+hostarch.Addr(done), dst[done:end], false)
@@ -327,7 +605,29 @@ func (s *subprocess) CopyOut(addr hostarch.Addr, src []byte) (int, error) {
 	if !hemiGvisorContainsUserMem(addr, uint64(len(src))) {
 		return 0, platform.AddressSpaceIOUnavailable{}
 	}
+	if len(src) == 0 {
+		return 0, nil
+	}
+	s.hemiGvisorPortalMu.Lock()
+	defer s.hemiGvisorPortalMu.Unlock()
+	return s.hemiGvisorCopyOutLocked(addr, src)
+}
+
+// hemiGvisorCopyOutLocked copies src into target memory.
+//
+// Preconditions: s.hemiGvisorPortalMu is locked.
+func (s *subprocess) hemiGvisorCopyOutLocked(addr hostarch.Addr, src []byte) (int, error) {
 	var done int
+	if device := s.hemiGvisorDevice; device != nil && s.hemiGvisorActive() {
+		if n, err, ok := device.tryRingTransfer(
+			s.hemiGvisorMMHandle, addr, src, linux.HEMI_GVISOR_RING_OP_WRITE); ok {
+			done = n
+			var enterErr *hemiGvisorRingEnterError
+			if err == nil || !errors.As(err, &enterErr) {
+				return n, err
+			}
+		}
+	}
 	for done < len(src) {
 		end := min(done+hemiGvisorUserMemMax, len(src))
 		n, err := s.hemiGvisorUserMem(addr+hostarch.Addr(done), src[done:end], true)
@@ -343,11 +643,15 @@ func (s *subprocess) ZeroOut(addr hostarch.Addr, toZero uintptr) (uintptr, error
 	if !hemiGvisorContainsUserMem(addr, uint64(toZero)) {
 		return 0, platform.AddressSpaceIOUnavailable{}
 	}
-	zero := make([]byte, min(toZero, hostarch.PageSize))
+	if toZero == 0 {
+		return 0, nil
+	}
+	s.hemiGvisorPortalMu.Lock()
+	defer s.hemiGvisorPortalMu.Unlock()
 	var done uintptr
 	for done < toZero {
-		length := min(toZero-done, uintptr(len(zero)))
-		n, err := s.CopyOut(addr+hostarch.Addr(done), zero[:length])
+		length := min(toZero-done, uintptr(len(hemiGvisorZeroBuffer)))
+		n, err := s.hemiGvisorCopyOutLocked(addr+hostarch.Addr(done), hemiGvisorZeroBuffer[:length])
 		done += uintptr(n)
 		if err != nil {
 			return done, err
@@ -372,8 +676,10 @@ func (s *subprocess) hemiGvisorAtomicUint32(addr hostarch.Addr, op, old, new uin
 	if !hemiGvisorContainsUserMem(addr, 4) {
 		return 0, platform.AddressSpaceIOUnavailable{}
 	}
-	deviceFD, ok := hemiGvisorDeviceFD()
-	if !ok || !s.hemiGvisorActive() {
+	s.hemiGvisorPortalMu.Lock()
+	defer s.hemiGvisorPortalMu.Unlock()
+	device := s.hemiGvisorDevice
+	if device == nil || !s.hemiGvisorActive() {
 		return 0, platform.AddressSpaceIOUnavailable{}
 	}
 
@@ -385,7 +691,7 @@ func (s *subprocess) hemiGvisorAtomicUint32(addr hostarch.Addr, op, old, new uin
 		New:      new,
 	}
 	errno := hostsyscall.RawSyscallErrno6(
-		unix.SYS_IOCTL, uintptr(deviceFD), uintptr(linux.HEMI_GVISOR_ATOMIC_U32),
+		unix.SYS_IOCTL, uintptr(device.fd), uintptr(linux.HEMI_GVISOR_ATOMIC_U32),
 		uintptr(unsafe.Pointer(&req)), 0, 0, 0)
 	if errno == 0 {
 		return req.Value, nil
@@ -410,8 +716,13 @@ func (s *subprocess) prepareHemiGvisorMapFile(ctx context.Context, c *platformCo
 	if flags&linux.MAP_ANONYMOUS != 0 {
 		return
 	}
-	devFD, ok := hemiGvisorDeviceFD()
-	if !ok {
+	// Device state is immutable after publication and remains referenced by the
+	// subprocess across pooling, so it is safe to use this snapshot after
+	// dropping the portal lock.
+	s.hemiGvisorPortalMu.Lock()
+	device := s.hemiGvisorDevice
+	s.hemiGvisorPortalMu.Unlock()
+	if device == nil {
 		return
 	}
 	task, ok := ctx.(hemiGvisorTask)
@@ -432,7 +743,7 @@ func (s *subprocess) prepareHemiGvisorMapFile(ctx context.Context, c *platformCo
 		HostFD:      int64(hostFD),
 		HostOffset:  hostOffset,
 	}
-	s.hemiGvisorMapFileIoctl(int32(devFD), req)
+	s.hemiGvisorMapFileIoctl(device.fd, req)
 }
 
 func (s *subprocess) hemiGvisorMapFileIoctl(devFD int32, req linux.HemiGvisorMapFile) {

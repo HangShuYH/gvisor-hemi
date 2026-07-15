@@ -18,6 +18,8 @@ import "structs"
 
 const (
 	HEMI_GVISOR_IOCTL_TYPE = uint32('H')
+	HEMI_GVISOR_RING_ABI   = uint32(1)
+	HEMI_GVISOR_RING_MAGIC = uint64(0x48454d4952494e47)
 
 	// HEMI_GVISOR_VMAR_START and HEMI_GVISOR_VMAR_END define the half-open
 	// user virtual-address range managed by HEMI.
@@ -142,6 +144,84 @@ type HemiGvisorProbeUser struct {
 
 var (
 	HEMI_GVISOR_PROBE_USER = IOWR(HEMI_GVISOR_IOCTL_TYPE, 0x14, uint32((*HemiGvisorProbeUser)(nil).SizeBytes()))
+)
+
+// HemiGvisorRingSetup is struct hemi_gvisor_ring_setup from
+// include/uapi/linux/hemi_gvisor.h.
+//
+// +marshal
+type HemiGvisorRingSetup struct {
+	_                structs.HostLayout
+	ABIVersion       uint32
+	Flags            uint32
+	Features         uint64
+	RingID           uint64
+	MmapOffset       uint64
+	MmapSize         uint64
+	Entries          uint32
+	DescriptorOffset uint32
+	DescriptorSize   uint32
+	DataOffset       uint32
+	DataStride       uint32
+	MaxBytes         uint32
+}
+
+// HemiGvisorRingHeader is the read-only geometry header at the beginning of a
+// HEMI ring mapping.
+//
+// +marshal
+type HemiGvisorRingHeader struct {
+	_                structs.HostLayout
+	Magic            uint64
+	ABIVersion       uint32
+	HeaderSize       uint32
+	RingID           uint64
+	Entries          uint32
+	DescriptorOffset uint32
+	DescriptorSize   uint32
+	DataOffset       uint32
+	DataStride       uint32
+	MaxBytes         uint32
+	Features         uint64
+	Reserved         uint64
+}
+
+const (
+	HEMI_GVISOR_RING_OP_READ  = uint16(1)
+	HEMI_GVISOR_RING_OP_WRITE = uint16(2)
+)
+
+// HemiGvisorRingDescriptor is struct hemi_gvisor_ring_descriptor from
+// include/uapi/linux/hemi_gvisor.h.
+//
+// +marshal
+type HemiGvisorRingDescriptor struct {
+	_        structs.HostLayout
+	Addr     uint64
+	Len      uint32
+	Op       uint16
+	Flags    uint16
+	Done     uint32
+	Result   int32
+	Reserved [5]uint64
+}
+
+// HemiGvisorRingEnter is struct hemi_gvisor_ring_enter from
+// include/uapi/linux/hemi_gvisor.h.
+//
+// +marshal
+type HemiGvisorRingEnter struct {
+	_        structs.HostLayout
+	RingID   uint64
+	MMHandle uint64
+	Count    uint32
+	Flags    uint32
+	Reserved uint64
+}
+
+var (
+	HEMI_GVISOR_SETUP_RING = IOWR(HEMI_GVISOR_IOCTL_TYPE, 0x15, uint32((*HemiGvisorRingSetup)(nil).SizeBytes()))
+	HEMI_GVISOR_ENTER_RING = IOW(HEMI_GVISOR_IOCTL_TYPE, 0x16, uint32((*HemiGvisorRingEnter)(nil).SizeBytes()))
 )
 
 const (

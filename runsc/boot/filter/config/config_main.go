@@ -144,6 +144,16 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 			seccomp.EqualTo(linux.HEMI_GVISOR_PROBE_USER),
 			seccomp.AnyValue{},
 		},
+		seccomp.PerArg{
+			seccomp.NonNegativeFD{},
+			seccomp.EqualTo(linux.HEMI_GVISOR_SETUP_RING),
+			seccomp.AnyValue{},
+		},
+		seccomp.PerArg{
+			seccomp.NonNegativeFD{},
+			seccomp.EqualTo(linux.HEMI_GVISOR_ENTER_RING),
+			seccomp.AnyValue{},
+		},
 		// These commands are needed for host FD.
 		seccomp.PerArg{
 			seccomp.NonNegativeFD{}, /* fd */

@@ -64,14 +64,23 @@ const (
 	// see CopyOutFrom for details.
 	rwMapMinBytes = 512
 
-	// iterIOBufSize bounds buffering for callers that opt in to repeated
-	// Reader/Writer calls. It matches the current HEMI portal batch size.
-	iterIOBufSize = 64 << 10
+	// iterIOSmallBufSize is the default bound for callers that opt in to
+	// repeated Reader/Writer calls. iterIOLargeBufSize bounds an optional
+	// larger batch requested by an AddressSpaceIO implementation.
+	iterIOSmallBufSize = 64 << 10
+	iterIOLargeBufSize = 512 << 10
 )
 
-var iterIOBufPool = sync.Pool{
+var iterIOSmallBufPool = sync.Pool{
 	New: func() any {
-		buf := make([]byte, iterIOBufSize)
+		buf := make([]byte, iterIOSmallBufSize)
+		return &buf
+	},
+}
+
+var iterIOLargeBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, iterIOLargeBufSize)
 		return &buf
 	},
 }
@@ -134,6 +143,20 @@ func (mm *MemoryManager) asioReadEnabledForSize(opts usermem.IOOpts, size, thres
 		return true
 	}
 	return size < threshold
+}
+
+func (mm *MemoryManager) getIterIOBuf() (*[]byte, *sync.Pool, int) {
+	size := iterIOSmallBufSize
+	if sizer, ok := mm.as.(platform.AddressSpaceIOBatchSizer); ok {
+		if requested := sizer.AddressSpaceIOBatchSize(); requested > size {
+			size = min(requested, iterIOLargeBufSize)
+		}
+	}
+	pool := &iterIOSmallBufPool
+	if size > iterIOSmallBufSize {
+		pool = &iterIOLargeBufPool
+	}
+	return pool.Get().(*[]byte), pool, size
 }
 
 // translateIOError converts errors to EFAULT, as is usually reported for all
@@ -413,9 +436,9 @@ func (mm *MemoryManager) CopyOutFromIter(ctx context.Context, ars hostarch.AddrR
 		return mm.withVecInternalMappings(ctx, ars, hostarch.Write, opts.IgnorePermissions, src.ReadToBlocks)
 	}
 
-	bufPtr := iterIOBufPool.Get().(*[]byte)
-	buf := (*bufPtr)[:iterIOBufSize]
-	defer iterIOBufPool.Put(bufPtr)
+	bufPtr, pool, size := mm.getIterIOBuf()
+	buf := (*bufPtr)[:size]
+	defer pool.Put(bufPtr)
 	return copyOutFromIter(ars, src, buf, func(ar hostarch.AddrRange, src []byte) (int, error) {
 		return mm.asCopyOut(ctx, ar, src, opts)
 	})
@@ -438,9 +461,9 @@ func (mm *MemoryManager) CopyInToIter(ctx context.Context, ars hostarch.AddrRang
 		return mm.withVecInternalMappings(ctx, ars, hostarch.Read, opts.IgnorePermissions, dst.WriteFromBlocks)
 	}
 
-	bufPtr := iterIOBufPool.Get().(*[]byte)
-	buf := (*bufPtr)[:iterIOBufSize]
-	defer iterIOBufPool.Put(bufPtr)
+	bufPtr, pool, size := mm.getIterIOBuf()
+	buf := (*bufPtr)[:size]
+	defer pool.Put(bufPtr)
 	return copyInToIter(ars, dst, buf, func(ar hostarch.AddrRange, dst []byte) (int, error) {
 		return mm.asCopyIn(ctx, ar, dst, opts)
 	})
