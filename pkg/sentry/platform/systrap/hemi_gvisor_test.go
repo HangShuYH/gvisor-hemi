@@ -52,17 +52,28 @@ func TestHemiGvisorContainsUserMem(t *testing.T) {
 
 func TestHemiGvisorKeepSyscallUnpatched(t *testing.T) {
 	inactive := subprocess{}
-	if inactive.hemiGvisorKeepSyscallUnpatched(unix.SYS_MMAP) {
-		t.Fatal("inactive HEMI subprocess kept mmap unpatched")
-	}
-
 	active := subprocess{hemiGvisorTGID: 1}
-	for _, sysno := range []uintptr{unix.SYS_MMAP, unix.SYS_MUNMAP, unix.SYS_MPROTECT} {
+	for _, sysno := range []uintptr{
+		unix.SYS_MMAP,
+		unix.SYS_MUNMAP,
+		unix.SYS_MPROTECT,
+		unix.SYS_BRK,
+	} {
+		if inactive.hemiGvisorKeepSyscallUnpatched(sysno) {
+			t.Errorf("inactive HEMI subprocess kept memory syscall %d unpatched", sysno)
+		}
 		if !active.hemiGvisorKeepSyscallUnpatched(sysno) {
-			t.Errorf("active HEMI subprocess allowed syscall %d to be patched", sysno)
+			t.Errorf("active HEMI subprocess allowed memory syscall %d to be patched", sysno)
 		}
 	}
-	if active.hemiGvisorKeepSyscallUnpatched(unix.SYS_READ) {
-		t.Fatal("active HEMI subprocess kept unrelated read syscall unpatched")
+	for _, sysno := range []uintptr{
+		unix.SYS_READ,
+		unix.SYS_WRITE,
+		unix.SYS_FUTEX,
+		unix.SYS_GETPID,
+	} {
+		if active.hemiGvisorKeepSyscallUnpatched(sysno) {
+			t.Errorf("active HEMI subprocess kept non-memory syscall %d unpatched", sysno)
+		}
 	}
 }

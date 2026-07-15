@@ -155,15 +155,16 @@ func (s *subprocess) ForkAddressSpaceFrom(source platform.AddressSpace) error {
 }
 
 // hemiGvisorKeepSyscallUnpatched reports whether sysno must continue entering
-// the host kernel so that the HEMI direct hook can observe it. A file mmap may
-// initially fall back to the sentry; allowing usertrap to patch that call site
-// would make later anonymous mmaps from the same site bypass the direct hook.
+// the host kernel so that the HEMI direct hook can observe it. All other
+// syscalls retain usertrap patching. usertrap only patches call sites with an
+// immediate syscall number, so a patched non-memory call site can't later issue
+// one of the memory syscalls below.
 func (s *subprocess) hemiGvisorKeepSyscallUnpatched(sysno uintptr) bool {
 	if s.hemiGvisorTGID <= 0 {
 		return false
 	}
 	switch sysno {
-	case unix.SYS_MMAP, unix.SYS_MUNMAP, unix.SYS_MPROTECT:
+	case unix.SYS_MMAP, unix.SYS_MUNMAP, unix.SYS_MPROTECT, unix.SYS_BRK:
 		return true
 	default:
 		return false
