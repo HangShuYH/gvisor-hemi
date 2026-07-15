@@ -54,6 +54,41 @@ func TestHemiGvisorContainsUserMem(t *testing.T) {
 	}
 }
 
+func TestHemiGvisorAddressSpaceIOApplicablePrefix(t *testing.T) {
+	const (
+		start = hostarch.Addr(linux.HEMI_GVISOR_VMAR_START)
+		end   = hostarch.Addr(linux.HEMI_GVISOR_VMAR_END)
+	)
+	tests := []struct {
+		name           string
+		ar             hostarch.AddrRange
+		wantLength     hostarch.Addr
+		wantApplicable bool
+	}{
+		{name: "below range", ar: hostarch.AddrRange{Start: start - 2, End: start - 1}, wantLength: 1},
+		{name: "crosses start", ar: hostarch.AddrRange{Start: start - 1, End: start + 1}, wantLength: 1},
+		{name: "inside range", ar: hostarch.AddrRange{Start: start, End: start + 1}, wantLength: 1, wantApplicable: true},
+		{name: "crosses end", ar: hostarch.AddrRange{Start: end - 1, End: end + 1}, wantLength: 1, wantApplicable: true},
+		{name: "above range", ar: hostarch.AddrRange{Start: end, End: end + 1}, wantLength: 1},
+	}
+
+	s := subprocess{hemiGvisorTGID: 1, hemiGvisorMMHandle: 1}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			gotLength, gotApplicable := s.AddressSpaceIOApplicablePrefix(test.ar)
+			if gotLength != test.wantLength || gotApplicable != test.wantApplicable {
+				t.Fatalf("AddressSpaceIOApplicablePrefix(%v) = (%d, %t), want (%d, %t)", test.ar, gotLength, gotApplicable, test.wantLength, test.wantApplicable)
+			}
+		})
+	}
+
+	inactive := subprocess{}
+	ar := hostarch.AddrRange{Start: start, End: start + 1}
+	if gotLength, gotApplicable := inactive.AddressSpaceIOApplicablePrefix(ar); gotLength != ar.Length() || gotApplicable {
+		t.Fatalf("inactive AddressSpaceIOApplicablePrefix(%v) = (%d, %t), want (%d, false)", ar, gotLength, gotApplicable, ar.Length())
+	}
+}
+
 func TestHemiGvisorKeepSyscallUnpatched(t *testing.T) {
 	inactive := subprocess{}
 	active := subprocess{hemiGvisorTGID: 1, hemiGvisorMMHandle: 1}

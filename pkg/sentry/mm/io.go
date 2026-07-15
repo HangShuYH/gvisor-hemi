@@ -118,6 +118,60 @@ func (mm *MemoryManager) asioEnabled(opts usermem.IOOpts) bool {
 	return mm.haveASIO && !opts.IgnorePermissions
 }
 
+// asioPrefix returns the first non-empty subrange of ar for which
+// AddressSpaceIO applicability is uniform.
+//
+// Preconditions: ar is well-formed and non-empty.
+func (mm *MemoryManager) asioPrefix(ar hostarch.AddrRange) (hostarch.AddrRange, bool) {
+	length := ar.Length()
+	applicable := true
+	if classifier, ok := mm.as.(platform.AddressSpaceIORangeApplicability); ok {
+		length, applicable = classifier.AddressSpaceIOApplicablePrefix(ar)
+		// Avoid an infinite loop if a platform violates the interface contract.
+		// Fall back to the legacy whole-range AddressSpaceIO selection.
+		if length == 0 || length > ar.Length() {
+			length = ar.Length()
+			applicable = true
+		}
+	}
+	return hostarch.AddrRange{Start: ar.Start, End: ar.Start + length}, applicable
+}
+
+func (mm *MemoryManager) asioApplicableToRange(ar hostarch.AddrRange) bool {
+	for ar.Length() != 0 {
+		prefix, applicable := mm.asioPrefix(ar)
+		if applicable {
+			return true
+		}
+		ar.Start = prefix.End
+	}
+	return false
+}
+
+func (mm *MemoryManager) asioApplicableToAny(ars hostarch.AddrRangeSeq) bool {
+	for !ars.IsEmpty() {
+		ar := ars.Head()
+		if mm.asioApplicableToRange(ar) {
+			return true
+		}
+		ars = ars.Tail()
+	}
+	return false
+}
+
+// asioApplicabilityForAtomic returns whether all or any of ar requires
+// AddressSpaceIO. A mixed result cannot be serviced atomically by either path.
+func (mm *MemoryManager) asioApplicabilityForAtomic(ar hostarch.AddrRange) (all, any bool) {
+	all = true
+	for ar.Length() != 0 {
+		prefix, applicable := mm.asioPrefix(ar)
+		all = all && applicable
+		any = any || applicable
+		ar.Start = prefix.End
+	}
+	return all, any
+}
+
 func (mm *MemoryManager) asioEnabledForSize(opts usermem.IOOpts, size, threshold uint64) bool {
 	if !mm.asioEnabled(opts) {
 		return false
@@ -183,7 +237,7 @@ func (mm *MemoryManager) CopyOut(ctx context.Context, addr hostarch.Addr, src []
 	}
 
 	// Do AddressSpace IO if applicable.
-	if mm.asioEnabledForSize(opts, uint64(len(src)), copyMapMinBytes) {
+	if mm.asioEnabledForSize(opts, uint64(len(src)), copyMapMinBytes) && mm.asioApplicableToRange(ar) {
 		return mm.asCopyOut(ctx, ar, src, opts)
 	}
 
@@ -198,7 +252,30 @@ func (mm *MemoryManager) CopyOut(ctx context.Context, addr hostarch.Addr, src []
 
 func (mm *MemoryManager) asCopyOut(ctx context.Context, ar hostarch.AddrRange, src []byte, opts usermem.IOOpts) (int, error) {
 	var done int
-	for {
+	for done < len(src) {
+		remaining := hostarch.AddrRange{Start: ar.Start + hostarch.Addr(done), End: ar.End}
+		prefix, applicable := mm.asioPrefix(remaining)
+		length := int(prefix.Length())
+		var n int
+		var err error
+		if applicable {
+			n, err = mm.asCopyOutApplicable(ctx, prefix, src[done:done+length], opts)
+		} else {
+			n, err = mm.imCopyOut(ctx, prefix, src[done:done+length], opts)
+		}
+		done += n
+		if err != nil || n != length {
+			return done, err
+		}
+	}
+	return done, nil
+}
+
+// asCopyOutApplicable copies through AddressSpaceIO for a range that the
+// platform classified as applicable.
+func (mm *MemoryManager) asCopyOutApplicable(ctx context.Context, ar hostarch.AddrRange, src []byte, opts usermem.IOOpts) (int, error) {
+	var done int
+	for done < len(src) {
 		n, err := mm.as.CopyOut(ar.Start+hostarch.Addr(done), src[done:])
 		done += n
 		if err == nil {
@@ -212,10 +289,15 @@ func (mm *MemoryManager) asCopyOut(ctx context.Context, ar hostarch.AddrRange, s
 		}
 		if _, ok := err.(platform.AddressSpaceIOUnavailable); ok {
 			// Fall back to using internal mappings.
-			return mm.imCopyOut(ctx, hostarch.AddrRange{ar.Start + hostarch.Addr(done), ar.End}, src[done:], opts)
+			if done == len(src) {
+				return done, nil
+			}
+			n, err := mm.imCopyOut(ctx, hostarch.AddrRange{ar.Start + hostarch.Addr(done), ar.End}, src[done:], opts)
+			return done + n, err
 		}
 		return done, translateIOError(ctx, err)
 	}
+	return done, nil
 }
 
 func (mm *MemoryManager) imCopyOut(ctx context.Context, ar hostarch.AddrRange, src []byte, opts usermem.IOOpts) (int, error) {
@@ -238,7 +320,7 @@ func (mm *MemoryManager) CopyIn(ctx context.Context, addr hostarch.Addr, dst []b
 	}
 
 	// Do AddressSpace IO if applicable.
-	if mm.asioReadEnabledForSize(opts, uint64(len(dst)), copyMapMinBytes) {
+	if mm.asioReadEnabledForSize(opts, uint64(len(dst)), copyMapMinBytes) && mm.asioApplicableToRange(ar) {
 		return mm.asCopyIn(ctx, ar, dst, opts)
 	}
 
@@ -253,7 +335,30 @@ func (mm *MemoryManager) CopyIn(ctx context.Context, addr hostarch.Addr, dst []b
 
 func (mm *MemoryManager) asCopyIn(ctx context.Context, ar hostarch.AddrRange, dst []byte, opts usermem.IOOpts) (int, error) {
 	var done int
-	for {
+	for done < len(dst) {
+		remaining := hostarch.AddrRange{Start: ar.Start + hostarch.Addr(done), End: ar.End}
+		prefix, applicable := mm.asioPrefix(remaining)
+		length := int(prefix.Length())
+		var n int
+		var err error
+		if applicable {
+			n, err = mm.asCopyInApplicable(ctx, prefix, dst[done:done+length], opts)
+		} else {
+			n, err = mm.imCopyIn(ctx, prefix, dst[done:done+length], opts)
+		}
+		done += n
+		if err != nil || n != length {
+			return done, err
+		}
+	}
+	return done, nil
+}
+
+// asCopyInApplicable copies through AddressSpaceIO for a range that the
+// platform classified as applicable.
+func (mm *MemoryManager) asCopyInApplicable(ctx context.Context, ar hostarch.AddrRange, dst []byte, opts usermem.IOOpts) (int, error) {
+	var done int
+	for done < len(dst) {
 		n, err := mm.as.CopyIn(ar.Start+hostarch.Addr(done), dst[done:])
 		done += n
 		if err == nil {
@@ -267,10 +372,15 @@ func (mm *MemoryManager) asCopyIn(ctx context.Context, ar hostarch.AddrRange, ds
 		}
 		if _, ok := err.(platform.AddressSpaceIOUnavailable); ok {
 			// Fall back to using internal mappings.
-			return mm.imCopyIn(ctx, hostarch.AddrRange{ar.Start + hostarch.Addr(done), ar.End}, dst[done:], opts)
+			if done == len(dst) {
+				return done, nil
+			}
+			n, err := mm.imCopyIn(ctx, hostarch.AddrRange{ar.Start + hostarch.Addr(done), ar.End}, dst[done:], opts)
+			return done + n, err
 		}
 		return done, translateIOError(ctx, err)
 	}
+	return done, nil
 }
 
 func (mm *MemoryManager) imCopyIn(ctx context.Context, ar hostarch.AddrRange, dst []byte, opts usermem.IOOpts) (int, error) {
@@ -293,7 +403,7 @@ func (mm *MemoryManager) ZeroOut(ctx context.Context, addr hostarch.Addr, toZero
 	}
 
 	// Do AddressSpace IO if applicable.
-	if mm.asioEnabledForSize(opts, uint64(toZero), copyMapMinBytes) {
+	if mm.asioEnabledForSize(opts, uint64(toZero), copyMapMinBytes) && mm.asioApplicableToRange(ar) {
 		return mm.asZeroOut(ctx, ar, opts)
 	}
 
@@ -303,7 +413,30 @@ func (mm *MemoryManager) ZeroOut(ctx context.Context, addr hostarch.Addr, toZero
 
 func (mm *MemoryManager) asZeroOut(ctx context.Context, ar hostarch.AddrRange, opts usermem.IOOpts) (int64, error) {
 	var done int64
-	for {
+	for done < int64(ar.Length()) {
+		remaining := hostarch.AddrRange{Start: ar.Start + hostarch.Addr(done), End: ar.End}
+		prefix, applicable := mm.asioPrefix(remaining)
+		length := int64(prefix.Length())
+		var n int64
+		var err error
+		if applicable {
+			n, err = mm.asZeroOutApplicable(ctx, prefix, opts)
+		} else {
+			n, err = mm.imZeroOut(ctx, prefix, opts)
+		}
+		done += n
+		if err != nil || n != length {
+			return done, err
+		}
+	}
+	return done, nil
+}
+
+// asZeroOutApplicable zeros through AddressSpaceIO for a range that the
+// platform classified as applicable.
+func (mm *MemoryManager) asZeroOutApplicable(ctx context.Context, ar hostarch.AddrRange, opts usermem.IOOpts) (int64, error) {
+	var done int64
+	for done < int64(ar.Length()) {
 		n, err := mm.as.ZeroOut(ar.Start+hostarch.Addr(done), uintptr(int64(ar.Length())-done))
 		done += int64(n)
 		if err == nil {
@@ -317,10 +450,15 @@ func (mm *MemoryManager) asZeroOut(ctx context.Context, ar hostarch.AddrRange, o
 		}
 		if _, ok := err.(platform.AddressSpaceIOUnavailable); ok {
 			// Fall back to using internal mappings.
-			return mm.imZeroOut(ctx, hostarch.AddrRange{ar.Start + hostarch.Addr(done), ar.End}, opts)
+			if done == int64(ar.Length()) {
+				return done, nil
+			}
+			n, err := mm.imZeroOut(ctx, hostarch.AddrRange{ar.Start + hostarch.Addr(done), ar.End}, opts)
+			return done + n, err
 		}
 		return done, translateIOError(ctx, err)
 	}
+	return done, nil
 }
 
 func (mm *MemoryManager) imZeroOut(ctx context.Context, ar hostarch.AddrRange, opts usermem.IOOpts) (int64, error) {
@@ -343,7 +481,7 @@ func (mm *MemoryManager) CopyOutFrom(ctx context.Context, ars hostarch.AddrRange
 	}
 
 	// Do AddressSpace IO if applicable.
-	if mm.asioEnabledForSize(opts, uint64(ars.NumBytes()), rwMapMinBytes) {
+	if mm.asioEnabledForSize(opts, uint64(ars.NumBytes()), rwMapMinBytes) && mm.asioApplicableToAny(ars) {
 		// We have to introduce a buffered copy, instead of just passing a
 		// safemem.BlockSeq representing addresses in the AddressSpace to src.
 		// This is because usermem.IO.CopyOutFrom() guarantees that it calls
@@ -390,7 +528,7 @@ func (mm *MemoryManager) CopyInTo(ctx context.Context, ars hostarch.AddrRangeSeq
 	}
 
 	// Do AddressSpace IO if applicable.
-	if mm.asioReadEnabledForSize(opts, uint64(ars.NumBytes()), rwMapMinBytes) {
+	if mm.asioReadEnabledForSize(opts, uint64(ars.NumBytes()), rwMapMinBytes) && mm.asioApplicableToAny(ars) {
 		buf := make([]byte, int(ars.NumBytes()))
 		var done int
 		var bufErr error
@@ -432,7 +570,7 @@ func (mm *MemoryManager) CopyOutFromIter(ctx context.Context, ars hostarch.AddrR
 		return 0, nil
 	}
 
-	if !mm.asioEnabledForSize(opts, uint64(ars.NumBytes()), rwMapMinBytes) {
+	if !mm.asioEnabledForSize(opts, uint64(ars.NumBytes()), rwMapMinBytes) || !mm.asioApplicableToAny(ars) {
 		return mm.withVecInternalMappings(ctx, ars, hostarch.Write, opts.IgnorePermissions, src.ReadToBlocks)
 	}
 
@@ -457,7 +595,7 @@ func (mm *MemoryManager) CopyInToIter(ctx context.Context, ars hostarch.AddrRang
 		return 0, nil
 	}
 
-	if !mm.asioReadEnabledForSize(opts, uint64(ars.NumBytes()), rwMapMinBytes) {
+	if !mm.asioReadEnabledForSize(opts, uint64(ars.NumBytes()), rwMapMinBytes) || !mm.asioApplicableToAny(ars) {
 		return mm.withVecInternalMappings(ctx, ars, hostarch.Read, opts.IgnorePermissions, dst.WriteFromBlocks)
 	}
 
@@ -611,14 +749,51 @@ func (mm *MemoryManager) EnsurePMAsExist(ctx context.Context, addr hostarch.Addr
 	if !ok {
 		return 0, linuxerr.EFAULT
 	}
-	if mm.asioEnabled(opts) {
-		if ensure, ok := mm.as.(platform.AddressSpaceIOEnsureAccess); ok {
-			n, err := ensure.EnsureAccess(ar.Start, uint64(ar.Length()), hostarch.Write)
-			if _, unavailable := err.(platform.AddressSpaceIOUnavailable); !unavailable {
-				return int64(n), translateIOError(ctx, err)
-			}
+	if ar.Length() == 0 {
+		return 0, nil
+	}
+	if !mm.asioEnabled(opts) {
+		return mm.imEnsurePMAsExist(ctx, ar, opts)
+	}
+	ensure, canEnsure := mm.as.(platform.AddressSpaceIOEnsureAccess)
+	if !canEnsure || !mm.asioApplicableToRange(ar) {
+		return mm.imEnsurePMAsExist(ctx, ar, opts)
+	}
+
+	var done int64
+	for done < int64(ar.Length()) {
+		remaining := hostarch.AddrRange{Start: ar.Start + hostarch.Addr(done), End: ar.End}
+		prefix, applicable := mm.asioPrefix(remaining)
+		length := int64(prefix.Length())
+		var n int64
+		var err error
+		if applicable {
+			n, err = mm.asEnsurePMAsExist(ctx, ensure, prefix, opts)
+		} else {
+			n, err = mm.imEnsurePMAsExist(ctx, prefix, opts)
+		}
+		done += n
+		if err != nil || n != length {
+			return done, err
 		}
 	}
+	return done, nil
+}
+
+func (mm *MemoryManager) asEnsurePMAsExist(ctx context.Context, ensure platform.AddressSpaceIOEnsureAccess, ar hostarch.AddrRange, opts usermem.IOOpts) (int64, error) {
+	n, err := ensure.EnsureAccess(ar.Start, uint64(ar.Length()), hostarch.Write)
+	done := int64(n)
+	if _, unavailable := err.(platform.AddressSpaceIOUnavailable); !unavailable {
+		return done, translateIOError(ctx, err)
+	}
+	if done == int64(ar.Length()) {
+		return done, nil
+	}
+	fallbackDone, err := mm.imEnsurePMAsExist(ctx, hostarch.AddrRange{Start: ar.Start + hostarch.Addr(done), End: ar.End}, opts)
+	return done + fallbackDone, err
+}
+
+func (mm *MemoryManager) imEnsurePMAsExist(ctx context.Context, ar hostarch.AddrRange, opts usermem.IOOpts) (int64, error) {
 	n64, err := mm.withInternalMappings(ctx, ar, hostarch.Write, opts.IgnorePermissions, func(ims safemem.BlockSeq) (uint64, error) {
 		return uint64(ims.NumBytes()), nil
 	})
@@ -632,8 +807,17 @@ func (mm *MemoryManager) SwapUint32(ctx context.Context, addr hostarch.Addr, new
 		return 0, linuxerr.EFAULT
 	}
 
-	// Do AddressSpace IO if applicable.
+	// Do AddressSpace IO if applicable. A range split between AddressSpaceIO
+	// and internal mappings cannot preserve atomicity.
+	useASIO := false
 	if mm.asioEnabled(opts) {
+		allApplicable, anyApplicable := mm.asioApplicabilityForAtomic(ar)
+		if anyApplicable && !allApplicable {
+			return 0, linuxerr.EFAULT
+		}
+		useASIO = allApplicable
+	}
+	if useASIO {
 		for {
 			old, err := mm.as.SwapUint32(ar.Start, new)
 			if err == nil {
@@ -679,8 +863,17 @@ func (mm *MemoryManager) CompareAndSwapUint32(ctx context.Context, addr hostarch
 		return 0, linuxerr.EFAULT
 	}
 
-	// Do AddressSpace IO if applicable.
+	// Do AddressSpace IO if applicable. A range split between AddressSpaceIO
+	// and internal mappings cannot preserve atomicity.
+	useASIO := false
 	if mm.asioEnabled(opts) {
+		allApplicable, anyApplicable := mm.asioApplicabilityForAtomic(ar)
+		if anyApplicable && !allApplicable {
+			return 0, linuxerr.EFAULT
+		}
+		useASIO = allApplicable
+	}
+	if useASIO {
 		for {
 			prev, err := mm.as.CompareAndSwapUint32(ar.Start, old, new)
 			if err == nil {
@@ -726,8 +919,17 @@ func (mm *MemoryManager) LoadUint32(ctx context.Context, addr hostarch.Addr, opt
 		return 0, linuxerr.EFAULT
 	}
 
-	// Do AddressSpace IO if applicable.
+	// Do AddressSpace IO if applicable. A range split between AddressSpaceIO
+	// and internal mappings cannot preserve atomicity.
+	useASIO := false
 	if mm.asioEnabled(opts) {
+		allApplicable, anyApplicable := mm.asioApplicabilityForAtomic(ar)
+		if anyApplicable && !allApplicable {
+			return 0, linuxerr.EFAULT
+		}
+		useASIO = allApplicable
+	}
+	if useASIO {
 		for {
 			val, err := mm.as.LoadUint32(ar.Start)
 			if err == nil {

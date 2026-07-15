@@ -492,6 +492,24 @@ func (s *subprocess) AddressSpaceIOAllSizes() bool {
 	return s.hemiGvisorActive()
 }
 
+// AddressSpaceIOApplicablePrefix partitions ar at HEMI's authoritative
+// user-memory boundaries. This lets MemoryManager use internal mappings for
+// ordinary Sentry VMAs without sending a mixed range through the HEMI portal.
+func (s *subprocess) AddressSpaceIOApplicablePrefix(ar hostarch.AddrRange) (hostarch.Addr, bool) {
+	if !s.hemiGvisorActive() {
+		return ar.Length(), false
+	}
+	start := hostarch.Addr(linux.HEMI_GVISOR_VMAR_START)
+	end := hostarch.Addr(linux.HEMI_GVISOR_VMAR_END)
+	if ar.Start < start {
+		return min(ar.End, start) - ar.Start, false
+	}
+	if ar.Start < end {
+		return min(ar.End, end) - ar.Start, true
+	}
+	return ar.Length(), false
+}
+
 // AddressSpaceIOReadIgnoresPermissions reports that HEMI CopyIn reads through
 // HEMI's authoritative page tables and can service instruction-emulation reads.
 func (s *subprocess) AddressSpaceIOReadIgnoresPermissions() bool {

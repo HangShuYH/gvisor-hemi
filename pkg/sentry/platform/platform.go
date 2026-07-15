@@ -449,6 +449,23 @@ type AddressSpaceIOAllSizes interface {
 	AddressSpaceIOAllSizes() bool
 }
 
+// AddressSpaceIORangeApplicability is implemented by AddressSpaces for which
+// AddressSpaceIO is relevant only to selected application address ranges.
+// AddressSpaceIOApplicablePrefix partitions an I/O range into maximal prefixes
+// that either may require AddressSpaceIO or may use internal mappings.
+//
+// Implementations must be cheap, side-effect-free, allocation-free, and safe
+// for concurrent use.
+type AddressSpaceIORangeApplicability interface {
+	// AddressSpaceIOApplicablePrefix returns the length of the maximal prefix
+	// of ar for which applicable has the returned value. If applicable is
+	// false, internal mappings are authoritative for the entire prefix. The
+	// returned length must be in [1, ar.Length()].
+	//
+	// Preconditions: ar is well-formed and non-empty.
+	AddressSpaceIOApplicablePrefix(ar hostarch.AddrRange) (length hostarch.Addr, applicable bool)
+}
+
 // AddressSpaceIOReadIgnoresPermissions is implemented by AddressSpaces whose
 // CopyIn implementation can read application memory without enforcing the
 // application's mapping permissions. MemoryManager uses this for reads such as
