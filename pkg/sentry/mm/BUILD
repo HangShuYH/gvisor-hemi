@@ -184,6 +184,7 @@ go_test(
     size = "small",
     srcs = [
         "hemi_reservation_test.go",
+        "io_iter_test.go",
         "lifecycle_test.go",
         "mm_test.go",
     ],
@@ -192,6 +193,7 @@ go_test(
         "//pkg/context",
         "//pkg/errors/linuxerr",
         "//pkg/hostarch",
+        "//pkg/safemem",
         "//pkg/sentry/arch",
         "//pkg/sentry/contexttest",
         "//pkg/sentry/limits",

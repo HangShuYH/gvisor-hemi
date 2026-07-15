@@ -37,6 +37,22 @@ func newBytesIOString(s string) *BytesIO {
 	return &BytesIO{[]byte(s)}
 }
 
+type iterBytesIO struct {
+	*BytesIO
+	copyOutFromIterCalls int
+	copyInToIterCalls    int
+}
+
+func (b *iterBytesIO) CopyOutFromIter(ctx context.Context, ars hostarch.AddrRangeSeq, src safemem.Reader, opts IOOpts) (int64, error) {
+	b.copyOutFromIterCalls++
+	return b.CopyOutFrom(ctx, ars, src, opts)
+}
+
+func (b *iterBytesIO) CopyInToIter(ctx context.Context, ars hostarch.AddrRangeSeq, dst safemem.Writer, opts IOOpts) (int64, error) {
+	b.copyInToIterCalls++
+	return b.CopyInTo(ctx, ars, dst, opts)
+}
+
 func TestBytesIOCopyOutSuccess(t *testing.T) {
 	b := newBytesIOString("ABCDE")
 	n, err := b.CopyOut(newContext(), 1, []byte("foo"), IOOpts{})
@@ -160,6 +176,45 @@ func TestBytesIOCopyInToFailure(t *testing.T) {
 	}
 	if got, want := dst.Bytes(), []byte("foob"); !bytes.Equal(got, want) {
 		t.Errorf("dst.Bytes(): got %q, wanted %q", got, want)
+	}
+}
+
+func TestIOSequenceIterIODispatch(t *testing.T) {
+	b := &iterBytesIO{BytesIO: newBytesIOString("ABCD")}
+	seq := IOSequence{
+		IO:    b,
+		Addrs: hostarch.AddrRangeSeqOf(hostarch.AddrRange{Start: 1, End: 3}),
+	}
+	if n, err := seq.CopyOutFromIter(newContext(), safemem.FromIOReader{Reader: bytes.NewBufferString("xy")}); n != 2 || err != nil {
+		t.Fatalf("CopyOutFromIter = (%d, %v), want (2, nil)", n, err)
+	}
+	var got bytes.Buffer
+	if n, err := seq.CopyInToIter(newContext(), safemem.FromIOWriter{Writer: &got}); n != 2 || err != nil {
+		t.Fatalf("CopyInToIter = (%d, %v), want (2, nil)", n, err)
+	}
+	if b.copyOutFromIterCalls != 1 || b.copyInToIterCalls != 1 {
+		t.Fatalf("IterIO calls = (%d, %d), want (1, 1)", b.copyOutFromIterCalls, b.copyInToIterCalls)
+	}
+	if got.String() != "xy" {
+		t.Fatalf("copied data = %q, want %q", got.String(), "xy")
+	}
+}
+
+func TestIOSequenceIterIOFallback(t *testing.T) {
+	b := newBytesIOString("ABCD")
+	seq := IOSequence{
+		IO:    b,
+		Addrs: hostarch.AddrRangeSeqOf(hostarch.AddrRange{Start: 1, End: 3}),
+	}
+	if n, err := seq.CopyOutFromIter(newContext(), safemem.FromIOReader{Reader: bytes.NewBufferString("xy")}); n != 2 || err != nil {
+		t.Fatalf("CopyOutFromIter fallback = (%d, %v), want (2, nil)", n, err)
+	}
+	var got bytes.Buffer
+	if n, err := seq.CopyInToIter(newContext(), safemem.FromIOWriter{Writer: &got}); n != 2 || err != nil {
+		t.Fatalf("CopyInToIter fallback = (%d, %v), want (2, nil)", n, err)
+	}
+	if got.String() != "xy" {
+		t.Fatalf("fallback data = %q, want %q", got.String(), "xy")
 	}
 }
 

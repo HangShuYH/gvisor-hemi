@@ -168,7 +168,7 @@ func GetMetadata(ctx context.Context, mm *mm.MemoryManager, buf *bytes.Buffer, t
 	// until Linux 4.9 (272ddc8b3735 "proc: don't use FOLL_FORCE for reading
 	// cmdline and environment").
 	writer := &bufferWriter{buf: buf}
-	if n, err := mm.CopyInTo(ctx, hostarch.AddrRangeSeqOf(ar), writer, usermem.IOOpts{}); n == 0 || err != nil {
+	if n, err := mm.CopyInToIter(ctx, hostarch.AddrRangeSeqOf(ar), writer, usermem.IOOpts{}); n == 0 || err != nil {
 		// Nothing to copy or something went wrong.
 		return err
 	}
@@ -206,7 +206,7 @@ func GetMetadata(ctx context.Context, mm *mm.MemoryManager, buf *bytes.Buffer, t
 			}
 			arEnvv.End = end
 		}
-		if _, err := mm.CopyInTo(ctx, hostarch.AddrRangeSeqOf(arEnvv), writer, usermem.IOOpts{}); err != nil {
+		if _, err := mm.CopyInToIter(ctx, hostarch.AddrRangeSeqOf(arEnvv), writer, usermem.IOOpts{}); err != nil {
 			return err
 		}
 

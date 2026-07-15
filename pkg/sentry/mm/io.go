@@ -63,7 +63,20 @@ const (
 	// since AddressSpace copying in this case requires additional buffering;
 	// see CopyOutFrom for details.
 	rwMapMinBytes = 512
+
+	// iterIOBufSize bounds buffering for callers that opt in to repeated
+	// Reader/Writer calls. It matches the current HEMI portal batch size.
+	iterIOBufSize = 64 << 10
 )
+
+var iterIOBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, iterIOBufSize)
+		return &buf
+	},
+}
+
+var _ usermem.IterIO = (*MemoryManager)(nil)
 
 // CheckIORange is similar to hostarch.Addr.ToRange, but applies bounds checks
 // consistent with Linux's arch/x86/include/asm/uaccess.h:access_ok().
@@ -381,6 +394,189 @@ func (mm *MemoryManager) CopyInTo(ctx context.Context, ars hostarch.AddrRangeSeq
 
 	// Go through internal mappings.
 	return mm.withVecInternalMappings(ctx, ars, hostarch.Read, opts.IgnorePermissions, dst.WriteFromBlocks)
+}
+
+// CopyOutFromIter implements usermem.IterIO.CopyOutFromIter. It is equivalent
+// to CopyOutFrom, except that src may be called repeatedly so AddressSpace IO
+// can use a bounded buffer.
+func (mm *MemoryManager) CopyOutFromIter(ctx context.Context, ars hostarch.AddrRangeSeq, src safemem.Reader, opts usermem.IOOpts) (int64, error) {
+	var ok bool
+	ars, ok = mm.checkIOVec(ars)
+	if !ok {
+		return 0, linuxerr.EFAULT
+	}
+	if ars.NumBytes() == 0 {
+		return 0, nil
+	}
+
+	if !mm.asioEnabledForSize(opts, uint64(ars.NumBytes()), rwMapMinBytes) {
+		return mm.withVecInternalMappings(ctx, ars, hostarch.Write, opts.IgnorePermissions, src.ReadToBlocks)
+	}
+
+	bufPtr := iterIOBufPool.Get().(*[]byte)
+	buf := (*bufPtr)[:iterIOBufSize]
+	defer iterIOBufPool.Put(bufPtr)
+	return copyOutFromIter(ars, src, buf, func(ar hostarch.AddrRange, src []byte) (int, error) {
+		return mm.asCopyOut(ctx, ar, src, opts)
+	})
+}
+
+// CopyInToIter implements usermem.IterIO.CopyInToIter. It is equivalent to
+// CopyInTo, except that dst may be called repeatedly so AddressSpace IO can
+// use a bounded buffer.
+func (mm *MemoryManager) CopyInToIter(ctx context.Context, ars hostarch.AddrRangeSeq, dst safemem.Writer, opts usermem.IOOpts) (int64, error) {
+	var ok bool
+	ars, ok = mm.checkIOVec(ars)
+	if !ok {
+		return 0, linuxerr.EFAULT
+	}
+	if ars.NumBytes() == 0 {
+		return 0, nil
+	}
+
+	if !mm.asioReadEnabledForSize(opts, uint64(ars.NumBytes()), rwMapMinBytes) {
+		return mm.withVecInternalMappings(ctx, ars, hostarch.Read, opts.IgnorePermissions, dst.WriteFromBlocks)
+	}
+
+	bufPtr := iterIOBufPool.Get().(*[]byte)
+	buf := (*bufPtr)[:iterIOBufSize]
+	defer iterIOBufPool.Put(bufPtr)
+	return copyInToIter(ars, dst, buf, func(ar hostarch.AddrRange, dst []byte) (int, error) {
+		return mm.asCopyIn(ctx, ar, dst, opts)
+	})
+}
+
+func copyOutFromIter(ars hostarch.AddrRangeSeq, src safemem.Reader, buf []byte, copyOut func(hostarch.AddrRange, []byte) (int, error)) (int64, error) {
+	if len(buf) == 0 {
+		return 0, fmt.Errorf("iterative CopyOutFrom requires a non-empty buffer")
+	}
+
+	var done int64
+	for ars.NumBytes() != 0 {
+		want := len(buf)
+		if ars.NumBytes() < int64(want) {
+			want = int(ars.NumBytes())
+		}
+		n64, srcErr := src.ReadToBlocks(safemem.BlockSeqOf(safemem.BlockFromSafeSlice(buf[:want])))
+		if n64 > uint64(want) {
+			return done, fmt.Errorf("reader returned %d bytes for a %d-byte buffer", n64, want)
+		}
+		n := int(n64)
+		copied, copyErr := copyOutIterChunk(ars, buf[:n], copyOut)
+		done += int64(copied)
+		ars = ars.DropFirst(copied)
+		if copyErr != nil {
+			return done, copyErr
+		}
+		if srcErr != nil {
+			return done, srcErr
+		}
+		if n != want {
+			return done, nil
+		}
+	}
+	return done, nil
+}
+
+func copyOutIterChunk(ars hostarch.AddrRangeSeq, src []byte, copyOut func(hostarch.AddrRange, []byte) (int, error)) (int, error) {
+	var done int
+	for done != len(src) {
+		for !ars.IsEmpty() && ars.Head().Length() == 0 {
+			ars = ars.Tail()
+		}
+		if ars.IsEmpty() {
+			return done, fmt.Errorf("address ranges ended with %d bytes left to write", len(src)-done)
+		}
+		ar := ars.Head()
+		chunk := len(src) - done
+		if ar.Length() < hostarch.Addr(chunk) {
+			chunk = int(ar.Length())
+		}
+		chunkAR := hostarch.AddrRange{Start: ar.Start, End: ar.Start + hostarch.Addr(chunk)}
+		n, err := copyOut(chunkAR, src[done:done+chunk])
+		if n < 0 || n > chunk {
+			return done, fmt.Errorf("address space CopyOut returned %d bytes for a %d-byte buffer", n, chunk)
+		}
+		done += n
+		ars = ars.DropFirst(n)
+		if err != nil {
+			return done, err
+		}
+		if n != chunk {
+			return done, fmt.Errorf("address space CopyOut completed only %d/%d bytes without an error", n, chunk)
+		}
+	}
+	return done, nil
+}
+
+func copyInToIter(ars hostarch.AddrRangeSeq, dst safemem.Writer, buf []byte, copyIn func(hostarch.AddrRange, []byte) (int, error)) (int64, error) {
+	if len(buf) == 0 {
+		return 0, fmt.Errorf("iterative CopyInTo requires a non-empty buffer")
+	}
+
+	var done int64
+	for ars.NumBytes() != 0 {
+		want := len(buf)
+		if ars.NumBytes() < int64(want) {
+			want = int(ars.NumBytes())
+		}
+		n, copyErr := copyInIterChunk(ars, buf[:want], copyIn)
+		if n == 0 {
+			if copyErr == nil {
+				copyErr = fmt.Errorf("address space CopyIn completed 0/%d bytes without an error", want)
+			}
+			return done, copyErr
+		}
+
+		written64, writeErr := dst.WriteFromBlocks(safemem.BlockSeqOf(safemem.BlockFromSafeSlice(buf[:n])))
+		if written64 > uint64(n) {
+			return done, fmt.Errorf("writer consumed %d bytes from a %d-byte buffer", written64, n)
+		}
+		written := int(written64)
+		done += int64(written)
+		ars = ars.DropFirst(written)
+		if writeErr != nil {
+			return done, writeErr
+		}
+		if copyErr != nil {
+			return done, copyErr
+		}
+		if written != n {
+			return done, nil
+		}
+	}
+	return done, nil
+}
+
+func copyInIterChunk(ars hostarch.AddrRangeSeq, dst []byte, copyIn func(hostarch.AddrRange, []byte) (int, error)) (int, error) {
+	var done int
+	for done != len(dst) {
+		for !ars.IsEmpty() && ars.Head().Length() == 0 {
+			ars = ars.Tail()
+		}
+		if ars.IsEmpty() {
+			return done, fmt.Errorf("address ranges ended with %d bytes left to read", len(dst)-done)
+		}
+		ar := ars.Head()
+		chunk := len(dst) - done
+		if ar.Length() < hostarch.Addr(chunk) {
+			chunk = int(ar.Length())
+		}
+		chunkAR := hostarch.AddrRange{Start: ar.Start, End: ar.Start + hostarch.Addr(chunk)}
+		n, err := copyIn(chunkAR, dst[done:done+chunk])
+		if n < 0 || n > chunk {
+			return done, fmt.Errorf("address space CopyIn returned %d bytes for a %d-byte buffer", n, chunk)
+		}
+		done += n
+		ars = ars.DropFirst(n)
+		if err != nil {
+			return done, err
+		}
+		if n != chunk {
+			return done, fmt.Errorf("address space CopyIn completed only %d/%d bytes without an error", n, chunk)
+		}
+	}
+	return done, nil
 }
 
 // EnsurePMAsExist attempts to ensure that PMAs exist for the given addr with the

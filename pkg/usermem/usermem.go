@@ -90,12 +90,6 @@ type IO interface {
 	//		any preceding locks in the lock order.
 	CopyInTo(ctx context.Context, ars hostarch.AddrRangeSeq, dst safemem.Writer, opts IOOpts) (int64, error)
 
-	// TODO(jamieliu): The requirement that CopyOutFrom/CopyInTo call src/dst
-	// at most once, which is unnecessary in most cases, forces implementations
-	// to gather safemem.Blocks into a single slice to pass to src/dst. Add
-	// CopyOutFromIter/CopyInToIter, which relaxes this restriction, to avoid
-	// this allocation.
-
 	// SwapUint32 atomically sets the uint32 value at addr to new and
 	// returns the previous value.
 	//
@@ -122,6 +116,39 @@ type IO interface {
 	//		following locks in the lock order.
 	//	* addr must be aligned to a 4-byte boundary.
 	LoadUint32(ctx context.Context, addr hostarch.Addr, opts IOOpts) (uint32, error)
+}
+
+// IterIO is an optional extension to IO for callers whose Reader or Writer may
+// be invoked repeatedly. It permits implementations to transfer large IOVs
+// through a bounded buffer instead of gathering the complete IOV first.
+//
+// Unlike IO.CopyOutFrom and IO.CopyInTo, these methods may call
+// src.ReadToBlocks or dst.WriteFromBlocks any number of times. Each subsequent
+// call continues the same byte stream. Callers must use these methods only
+// when the Reader or Writer supports that behavior.
+type IterIO interface {
+	// CopyOutFromIter is equivalent to IO.CopyOutFrom, except that it may
+	// call src.ReadToBlocks repeatedly. Each call continues the same byte
+	// stream. It returns the number of bytes copied to ars, which may be less
+	// than the number of bytes read from src if copying fails.
+	//
+	// Preconditions:
+	//   - The caller must not hold mm.MemoryManager.mappingMu or any
+	//     following locks in the lock order.
+	//   - src.ReadToBlocks must not block on mm.MemoryManager.activeMu or
+	//     any preceding locks in the lock order.
+	CopyOutFromIter(ctx context.Context, ars hostarch.AddrRangeSeq, src safemem.Reader, opts IOOpts) (int64, error)
+
+	// CopyInToIter is equivalent to IO.CopyInTo, except that it may call
+	// dst.WriteFromBlocks repeatedly. Each call continues the same byte
+	// stream. It returns the number of bytes accepted by dst.
+	//
+	// Preconditions:
+	//   - The caller must not hold mm.MemoryManager.mappingMu or any
+	//     following locks in the lock order.
+	//   - dst.WriteFromBlocks must not block on mm.MemoryManager.activeMu or
+	//     any preceding locks in the lock order.
+	CopyInToIter(ctx context.Context, ars hostarch.AddrRangeSeq, dst safemem.Writer, opts IOOpts) (int64, error)
 }
 
 // IOOpts contains options applicable to all IO methods.
@@ -504,11 +531,33 @@ func (s IOSequence) CopyOutFrom(ctx context.Context, src safemem.Reader) (int64,
 	return s.IO.CopyOutFrom(ctx, s.Addrs, src, s.Opts)
 }
 
+// CopyOutFromIter invokes IterIO.CopyOutFromIter when supported. Otherwise it
+// falls back to CopyOutFrom, whose single Reader call is also valid here.
+//
+// Preconditions: Same as IterIO.CopyOutFromIter.
+func (s IOSequence) CopyOutFromIter(ctx context.Context, src safemem.Reader) (int64, error) {
+	if io, ok := s.IO.(IterIO); ok {
+		return io.CopyOutFromIter(ctx, s.Addrs, src, s.Opts)
+	}
+	return s.CopyOutFrom(ctx, src)
+}
+
 // CopyInTo invokes s.CopyInTo over s.Addrs.
 //
 // Preconditions: Same as IO.CopyInTo.
 func (s IOSequence) CopyInTo(ctx context.Context, dst safemem.Writer) (int64, error) {
 	return s.IO.CopyInTo(ctx, s.Addrs, dst, s.Opts)
+}
+
+// CopyInToIter invokes IterIO.CopyInToIter when supported. Otherwise it falls
+// back to CopyInTo, whose single Writer call is also valid here.
+//
+// Preconditions: Same as IterIO.CopyInToIter.
+func (s IOSequence) CopyInToIter(ctx context.Context, dst safemem.Writer) (int64, error) {
+	if io, ok := s.IO.(IterIO); ok {
+		return io.CopyInToIter(ctx, s.Addrs, dst, s.Opts)
+	}
+	return s.CopyInTo(ctx, dst)
 }
 
 // Reader returns an io.Reader that reads from s. Reads beyond the end of s
