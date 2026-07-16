@@ -25,6 +25,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/seccomp"
 	"gvisor.dev/gvisor/pkg/seccomp/precompiledseccomp"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
@@ -481,6 +482,43 @@ type AddressSpaceIOReadIgnoresPermissions interface {
 // MemoryManager may clamp larger values to a bounded maximum.
 type AddressSpaceIOBatchSizer interface {
 	AddressSpaceIOBatchSize() int
+}
+
+// AddressSpaceIOIter is implemented by AddressSpaces that can stream data
+// directly between a safemem Reader or Writer and a platform-owned reusable
+// buffer. It avoids an intermediate MemoryManager buffer when the platform
+// already has a bounce buffer, such as a shared descriptor ring.
+//
+// MemoryManager invokes these methods only when AddressSpaceIO is applicable
+// to every non-empty range in ars. Implementations may call src or dst
+// repeatedly, continuing the same byte stream on each call.
+//
+// If an implementation returns AddressSpaceIOUnavailable, it must do so with
+// zero progress and before invoking src or dst, so that MemoryManager can
+// safely fall back to its generic buffered implementation. Errors produced by
+// accessing ars must be wrapped in AddressSpaceIOStreamError; errors returned
+// by src or dst must be returned unchanged.
+type AddressSpaceIOIter interface {
+	CopyOutFromIter(ars hostarch.AddrRangeSeq, src safemem.Reader) (int64, error)
+	CopyInToIter(ars hostarch.AddrRangeSeq, dst safemem.Writer) (int64, error)
+}
+
+// AddressSpaceIOStreamError wraps an error caused by accessing the target
+// AddressSpace in AddressSpaceIOIter. It distinguishes target-memory failures,
+// which MemoryManager translates to EFAULT, from Reader or Writer errors,
+// which must retain their original semantics.
+type AddressSpaceIOStreamError struct {
+	Err error
+}
+
+// Error implements error.Error.
+func (e *AddressSpaceIOStreamError) Error() string {
+	return e.Err.Error()
+}
+
+// Unwrap returns the target AddressSpace error.
+func (e *AddressSpaceIOStreamError) Unwrap() error {
+	return e.Err
 }
 
 // AddressSpaceIOEnsureAccess is implemented by AddressSpaces that can fault in

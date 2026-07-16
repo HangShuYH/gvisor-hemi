@@ -24,8 +24,134 @@ import (
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
+
+type directIterTestAddressSpace struct {
+	platform.AddressSpace
+	streamUnavailable  bool
+	streamTargetErr    error
+	streamCopyOutCalls int
+	streamCopyInCalls  int
+	legacyCopyOutCalls int
+	legacyCopyInCalls  int
+	streamedOut        []byte
+	streamedIn         []byte
+}
+
+func (*directIterTestAddressSpace) AddressSpaceIOAllSizes() bool {
+	return true
+}
+
+func (*directIterTestAddressSpace) AddressSpaceIOApplicablePrefix(ar hostarch.AddrRange) (hostarch.Addr, bool) {
+	return ar.Length(), true
+}
+
+func (as *directIterTestAddressSpace) CopyOut(addr hostarch.Addr, src []byte) (int, error) {
+	as.legacyCopyOutCalls++
+	return len(src), nil
+}
+
+func (as *directIterTestAddressSpace) CopyIn(addr hostarch.Addr, dst []byte) (int, error) {
+	as.legacyCopyInCalls++
+	copy(dst, as.streamedIn)
+	return len(dst), nil
+}
+
+func (as *directIterTestAddressSpace) CopyOutFromIter(ars hostarch.AddrRangeSeq, src safemem.Reader) (int64, error) {
+	as.streamCopyOutCalls++
+	if as.streamUnavailable {
+		return 0, platform.AddressSpaceIOUnavailable{}
+	}
+	if as.streamTargetErr != nil {
+		return 0, &platform.AddressSpaceIOStreamError{Err: as.streamTargetErr}
+	}
+	buf := make([]byte, int(ars.NumBytes()))
+	n, err := src.ReadToBlocks(safemem.BlockSeqOf(safemem.BlockFromSafeSlice(buf)))
+	as.streamedOut = append(as.streamedOut, buf[:n]...)
+	return int64(n), err
+}
+
+func (as *directIterTestAddressSpace) CopyInToIter(ars hostarch.AddrRangeSeq, dst safemem.Writer) (int64, error) {
+	as.streamCopyInCalls++
+	if as.streamUnavailable {
+		return 0, platform.AddressSpaceIOUnavailable{}
+	}
+	if as.streamTargetErr != nil {
+		return 0, &platform.AddressSpaceIOStreamError{Err: as.streamTargetErr}
+	}
+	n, err := dst.WriteFromBlocks(safemem.BlockSeqOf(safemem.BlockFromSafeSlice(as.streamedIn[:int(ars.NumBytes())])))
+	return int64(n), err
+}
+
+func newDirectIterTestMemoryManager(as *directIterTestAddressSpace) *MemoryManager {
+	return &MemoryManager{
+		haveASIO: true,
+		as:       as,
+		layout:   arch.MmapLayout{MaxAddr: 0x10000},
+	}
+}
+
+func TestAddressSpaceIOIterUsesPlatformBuffer(t *testing.T) {
+	ars := hostarch.AddrRangeSeqOf(hostarch.AddrRange{Start: 0x5000, End: 0x5004})
+	as := &directIterTestAddressSpace{streamedIn: []byte("wxyz")}
+	mm := newDirectIterTestMemoryManager(as)
+
+	reader := safemem.BlockSeqReader{Blocks: safemem.BlockSeqOf(safemem.BlockFromSafeSlice([]byte("abcd")))}
+	if n, err := mm.CopyOutFromIter(context.Background(), ars, &reader, usermem.IOOpts{}); n != 4 || err != nil {
+		t.Fatalf("CopyOutFromIter = (%d, %v), want (4, nil)", n, err)
+	}
+	if got := string(as.streamedOut); got != "abcd" || as.streamCopyOutCalls != 1 || as.legacyCopyOutCalls != 0 {
+		t.Fatalf("streamed CopyOut = (%q, direct:%d, legacy:%d), want (abcd, 1, 0)", got, as.streamCopyOutCalls, as.legacyCopyOutCalls)
+	}
+
+	var got bytes.Buffer
+	if n, err := mm.CopyInToIter(context.Background(), ars, safemem.FromIOWriter{Writer: &got}, usermem.IOOpts{}); n != 4 || err != nil {
+		t.Fatalf("CopyInToIter = (%d, %v), want (4, nil)", n, err)
+	}
+	if got.String() != "wxyz" || as.streamCopyInCalls != 1 || as.legacyCopyInCalls != 0 {
+		t.Fatalf("streamed CopyIn = (%q, direct:%d, legacy:%d), want (wxyz, 1, 0)", got.String(), as.streamCopyInCalls, as.legacyCopyInCalls)
+	}
+}
+
+func TestAddressSpaceIOIterUnavailableFallsBackBeforeReader(t *testing.T) {
+	ars := hostarch.AddrRangeSeqOf(hostarch.AddrRange{Start: 0x5000, End: 0x5004})
+	as := &directIterTestAddressSpace{streamUnavailable: true}
+	mm := newDirectIterTestMemoryManager(as)
+	readerCalls := 0
+	reader := safemem.ReaderFunc(func(dsts safemem.BlockSeq) (uint64, error) {
+		readerCalls++
+		return dsts.NumBytes(), nil
+	})
+	if n, err := mm.CopyOutFromIter(context.Background(), ars, reader, usermem.IOOpts{}); n != 4 || err != nil {
+		t.Fatalf("fallback CopyOutFromIter = (%d, %v), want (4, nil)", n, err)
+	}
+	if readerCalls != 1 || as.streamCopyOutCalls != 1 || as.legacyCopyOutCalls != 1 {
+		t.Fatalf("fallback calls = (reader:%d, direct:%d, legacy:%d), want (1, 1, 1)", readerCalls, as.streamCopyOutCalls, as.legacyCopyOutCalls)
+	}
+}
+
+func TestAddressSpaceIOIterDistinguishesTargetAndSourceErrors(t *testing.T) {
+	ars := hostarch.AddrRangeSeqOf(hostarch.AddrRange{Start: 0x5000, End: 0x5004})
+	targetErr := errors.New("target error")
+	as := &directIterTestAddressSpace{streamTargetErr: targetErr}
+	mm := newDirectIterTestMemoryManager(as)
+	reader := safemem.BlockSeqReader{Blocks: safemem.BlockSeqOf(safemem.BlockFromSafeSlice([]byte("abcd")))}
+	if n, err := mm.CopyOutFromIter(context.Background(), ars, &reader, usermem.IOOpts{}); n != 0 || !linuxerr.Equals(linuxerr.EFAULT, err) {
+		t.Fatalf("target error = (%d, %v), want (0, EFAULT)", n, err)
+	}
+
+	sourceErr := errors.New("source error")
+	as = &directIterTestAddressSpace{}
+	mm = newDirectIterTestMemoryManager(as)
+	source := safemem.ReaderFunc(func(dsts safemem.BlockSeq) (uint64, error) {
+		return 0, sourceErr
+	})
+	if n, err := mm.CopyOutFromIter(context.Background(), ars, source, usermem.IOOpts{}); n != 0 || !errors.Is(err, sourceErr) {
+		t.Fatalf("source error = (%d, %v), want (0, source error)", n, err)
+	}
+}
 
 func TestCopyOutFromIterStreamsAcrossAddrRanges(t *testing.T) {
 	ars := hostarch.AddrRangeSeqFromSlice([]hostarch.AddrRange{

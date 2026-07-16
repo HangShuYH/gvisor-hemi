@@ -67,7 +67,7 @@ func (fd *regularFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 		data: data,
 		off:  uint64(offset),
 	}
-	return dst.CopyOutFrom(ctx, r)
+	return dst.CopyOutFromIter(ctx, r)
 }
 
 type regularFileReader struct {

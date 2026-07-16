@@ -24,6 +24,7 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 )
 
@@ -408,5 +409,105 @@ func TestHemiGvisorRingEnterErrorIsReturned(t *testing.T) {
 				t.Fatalf("ring ENTER error = (%d, %T(%v), calls:%d), want (%d, *hemiGvisorRingEnterError(EIO), %d)", n, err, err, called, test.wantProgress, test.failCall)
 			}
 		})
+	}
+}
+
+func TestHemiGvisorAddressSpaceIOIterUsesRingBuffer(t *testing.T) {
+	lane := newTestHemiGvisorRingLane()
+	lanes := make(chan *hemiGvisorRingLane, 1)
+	lanes <- lane
+	const (
+		deviceFD = int32(3)
+		mmHandle = uint64(5)
+		base     = hostarch.Addr(linux.HEMI_GVISOR_VMAR_START)
+	)
+	length := hemiGvisorRingBatchBytes + 123
+	source := make([]byte, length)
+	for i := range source {
+		source[i] = byte(i)
+	}
+
+	var ringWrite []byte
+	device := &hemiGvisorDeviceState{fd: deviceFD, lanes: lanes}
+	enterFn := func(gotFD int32, enter *linux.HemiGvisorRingEnter) unix.Errno {
+		if gotFD != deviceFD || enter.MMHandle != mmHandle {
+			t.Fatalf("ENTER = (fd:%d, handle:%d), want (%d, %d)", gotFD, enter.MMHandle, deviceFD, mmHandle)
+		}
+		for i := 0; i < int(enter.Count); i++ {
+			desc := lane.descriptor(i)
+			switch desc.Op {
+			case linux.HEMI_GVISOR_RING_OP_WRITE:
+				ringWrite = append(ringWrite, lane.data(i, int(desc.Len))...)
+			case linux.HEMI_GVISOR_RING_OP_READ:
+				offset := int(hostarch.Addr(desc.Addr) - base)
+				copy(lane.data(i, int(desc.Len)), source[offset:offset+int(desc.Len)])
+			default:
+				t.Fatalf("descriptor %d has unexpected op %d", i, desc.Op)
+			}
+			desc.Done = desc.Len
+			desc.Result = 0
+		}
+		return 0
+	}
+	s := subprocess{
+		hemiGvisorDevice:   device,
+		hemiGvisorTGID:     1,
+		hemiGvisorMMHandle: mmHandle,
+	}
+	ars := hostarch.AddrRangeSeqOf(hostarch.AddrRange{Start: base, End: base + hostarch.Addr(length)})
+
+	readerState := safemem.BlockSeqReader{Blocks: safemem.BlockSeqOf(safemem.BlockFromSafeSlice(source))}
+	readerCalls := 0
+	reader := safemem.ReaderFunc(func(dsts safemem.BlockSeq) (uint64, error) {
+		readerCalls++
+		block := dsts.Head().ToSlice()
+		if len(block) == 0 || &block[0] != &lane.mapping[hemiGvisorRingDataOffset] {
+			t.Fatal("Reader did not receive the ring lane data buffer directly")
+		}
+		return readerState.ReadToBlocks(dsts)
+	})
+	if n, err := s.copyOutFromIter(ars, reader, enterFn); n != int64(length) || err != nil {
+		t.Fatalf("CopyOutFromIter = (%d, %v), want (%d, nil)", n, err, length)
+	}
+	if readerCalls != 2 || !bytes.Equal(ringWrite, source) {
+		t.Fatalf("direct ring write used %d Reader calls and copied %d bytes, want 2 and %d", readerCalls, len(ringWrite), length)
+	}
+
+	var got bytes.Buffer
+	writerCalls := 0
+	writer := safemem.WriterFunc(func(srcs safemem.BlockSeq) (uint64, error) {
+		writerCalls++
+		block := srcs.Head().ToSlice()
+		if len(block) == 0 || &block[0] != &lane.mapping[hemiGvisorRingDataOffset] {
+			t.Fatal("Writer did not receive the ring lane data buffer directly")
+		}
+		return safemem.FromIOWriter{Writer: &got}.WriteFromBlocks(srcs)
+	})
+	if n, err := s.copyInToIter(ars, writer, enterFn); n != int64(length) || err != nil {
+		t.Fatalf("CopyInToIter = (%d, %v), want (%d, nil)", n, err, length)
+	}
+	if writerCalls != 2 || !bytes.Equal(got.Bytes(), source) {
+		t.Fatalf("direct ring read used %d Writer calls and copied %d bytes, want 2 and %d", writerCalls, got.Len(), length)
+	}
+}
+
+func TestHemiGvisorAddressSpaceIOIterUnavailableDoesNotConsumeStream(t *testing.T) {
+	device := &hemiGvisorDeviceState{lanes: make(chan *hemiGvisorRingLane)}
+	s := subprocess{
+		hemiGvisorDevice:   device,
+		hemiGvisorTGID:     1,
+		hemiGvisorMMHandle: 5,
+	}
+	ars := hostarch.AddrRangeSeqOf(hostarch.AddrRange{
+		Start: hostarch.Addr(linux.HEMI_GVISOR_VMAR_START),
+		End:   hostarch.Addr(linux.HEMI_GVISOR_VMAR_START + 1),
+	})
+	readerCalls := 0
+	_, err := s.CopyOutFromIter(ars, safemem.ReaderFunc(func(dsts safemem.BlockSeq) (uint64, error) {
+		readerCalls++
+		return 0, nil
+	}))
+	if _, ok := err.(platform.AddressSpaceIOUnavailable); !ok || readerCalls != 0 {
+		t.Fatalf("unavailable stream = (%T(%v), Reader calls:%d), want (AddressSpaceIOUnavailable, 0)", err, err, readerCalls)
 	}
 }

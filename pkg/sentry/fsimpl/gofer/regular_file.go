@@ -150,7 +150,7 @@ func (fd *regularFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 		rw := getDentryReadWriter(ctx, d, offset)
 		// Require the read to go to the remote file.
 		rw.direct = true
-		n, readErr = dst.CopyOutFrom(ctx, rw)
+		n, readErr = dst.CopyOutFromIter(ctx, rw)
 		putDentryReadWriter(rw)
 		if d.inode.fs.opts.interop != InteropModeShared {
 			// Compare Linux's mm/filemap.c:do_generic_file_read() => file_accessed().
@@ -158,7 +158,7 @@ func (fd *regularFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 		}
 	} else {
 		rw := getDentryReadWriter(ctx, d, offset)
-		n, readErr = dst.CopyOutFrom(ctx, rw)
+		n, readErr = dst.CopyOutFromIter(ctx, rw)
 		putDentryReadWriter(rw)
 		if d.inode.fs.opts.interop != InteropModeShared {
 			// Compare Linux's mm/filemap.c:do_generic_file_read() => file_accessed().
@@ -241,7 +241,7 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 		rw.direct = true
 	}
 
-	n, err := src.CopyInTo(ctx, rw)
+	n, err := src.CopyInToIter(ctx, rw)
 	if err != nil {
 		return n, offset + n, err
 	}

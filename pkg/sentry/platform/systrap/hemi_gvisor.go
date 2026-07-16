@@ -29,6 +29,7 @@ import (
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/hostsyscall"
 	"gvisor.dev/gvisor/pkg/memutil"
+	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
@@ -55,6 +56,8 @@ const (
 )
 
 var hemiGvisorZeroBuffer [hemiGvisorRingBatchBytes]byte
+
+var _ platform.AddressSpaceIOIter = (*subprocess)(nil)
 
 type hemiGvisorRingEnterFunc func(int32, *linux.HemiGvisorRingEnter) unix.Errno
 
@@ -215,6 +218,23 @@ func (l *hemiGvisorRingLane) data(index, length int) []byte {
 }
 
 func (l *hemiGvisorRingLane) transfer(deviceFD int32, mmHandle uint64, addr hostarch.Addr, data []byte, op uint16, enterFn hemiGvisorRingEnterFunc) (int, error) {
+	return l.transferData(deviceFD, mmHandle, addr, data, op, true, enterFn)
+}
+
+// transferInPlace transfers data already stored in, or to be consumed directly
+// from, the lane's shared data area. Keeping the platform bounce buffer as the
+// safemem Reader/Writer buffer avoids copying through a second Go slice.
+func (l *hemiGvisorRingLane) transferInPlace(deviceFD int32, mmHandle uint64, addr hostarch.Addr, data []byte, op uint16, enterFn hemiGvisorRingEnterFunc) (int, error) {
+	if len(data) == 0 {
+		return 0, nil
+	}
+	if len(data) > hemiGvisorRingBatchBytes || &data[0] != &l.mapping[hemiGvisorRingDataOffset] {
+		return 0, fmt.Errorf("HEMI gVisor in-place ring transfer received a non-lane buffer")
+	}
+	return l.transferData(deviceFD, mmHandle, addr, data, op, false, enterFn)
+}
+
+func (l *hemiGvisorRingLane) transferData(deviceFD int32, mmHandle uint64, addr hostarch.Addr, data []byte, op uint16, bounce bool, enterFn hemiGvisorRingEnterFunc) (int, error) {
 	var done int
 	for done < len(data) {
 		batchLen := min(len(data)-done, hemiGvisorRingBatchBytes)
@@ -229,7 +249,7 @@ func (l *hemiGvisorRingLane) transfer(deviceFD int32, mmHandle uint64, addr host
 				Len:  uint32(length),
 				Op:   op,
 			}
-			if op == linux.HEMI_GVISOR_RING_OP_WRITE {
+			if bounce && op == linux.HEMI_GVISOR_RING_OP_WRITE {
 				copy(l.data(i, length), data[done+described:done+described+length])
 			}
 			described += length
@@ -258,7 +278,7 @@ func (l *hemiGvisorRingLane) transfer(deviceFD int32, mmHandle uint64, addr host
 				return done + completed, fmt.Errorf("HEMI gVisor ring returned an invalid descriptor %d: %+v", i, *descriptor)
 			}
 			n, err := hemiGvisorUserMemResult(expectedAddr, length, uint64(descriptor.Done), descriptor.Result)
-			if op == linux.HEMI_GVISOR_RING_OP_READ && n != 0 {
+			if bounce && op == linux.HEMI_GVISOR_RING_OP_READ && n != 0 {
 				copy(data[done+completed:done+completed+n], l.data(i, n))
 			}
 			completed += n
@@ -526,6 +546,157 @@ func (s *subprocess) AddressSpaceIOBatchSize() int {
 		return hemiGvisorRingBatchBytes
 	}
 	return 0
+}
+
+func hemiGvisorContainsUserMemSeq(ars hostarch.AddrRangeSeq) bool {
+	for !ars.IsEmpty() {
+		ar := ars.Head()
+		if !hemiGvisorContainsUserMem(ar.Start, uint64(ar.Length())) {
+			return false
+		}
+		ars = ars.Tail()
+	}
+	return true
+}
+
+// hemiGvisorAcquireRingLane acquires a reusable shared bounce buffer without
+// invoking the stream. AddressSpaceIOUnavailable is therefore safe for
+// MemoryManager to handle by retrying through its generic buffered path.
+func (s *subprocess) hemiGvisorAcquireRingLane(ars hostarch.AddrRangeSeq) (*hemiGvisorDeviceState, *hemiGvisorRingLane, uint64, error) {
+	if !hemiGvisorContainsUserMemSeq(ars) {
+		return nil, nil, 0, platform.AddressSpaceIOUnavailable{}
+	}
+
+	s.hemiGvisorPortalMu.Lock()
+	defer s.hemiGvisorPortalMu.Unlock()
+	device := s.hemiGvisorDevice
+	if device == nil || device.lanes == nil || !s.hemiGvisorActive() {
+		return nil, nil, 0, platform.AddressSpaceIOUnavailable{}
+	}
+	select {
+	case lane := <-device.lanes:
+		return device, lane, s.hemiGvisorMMHandle, nil
+	default:
+		return nil, nil, 0, platform.AddressSpaceIOUnavailable{}
+	}
+}
+
+func (s *subprocess) hemiGvisorTransferRingInPlace(device *hemiGvisorDeviceState, lane *hemiGvisorRingLane, mmHandle uint64, addr hostarch.Addr, data []byte, op uint16, enterFn hemiGvisorRingEnterFunc) (int, error) {
+	s.hemiGvisorPortalMu.Lock()
+	defer s.hemiGvisorPortalMu.Unlock()
+	if !s.hemiGvisorActive() || s.hemiGvisorDevice != device || s.hemiGvisorMMHandle != mmHandle {
+		return 0, &platform.AddressSpaceIOStreamError{Err: fmt.Errorf("HEMI gVisor address space changed during ring transfer")}
+	}
+	n, err := lane.transferInPlace(device.fd, mmHandle, addr, data, op, enterFn)
+	if err != nil {
+		return n, &platform.AddressSpaceIOStreamError{Err: err}
+	}
+	return n, nil
+}
+
+// CopyOutFromIter implements platform.AddressSpaceIOIter.CopyOutFromIter. The
+// Reader fills the ring lane directly; ENTER_RING then copies from that same
+// shared buffer into HEMI-managed application memory.
+func (s *subprocess) CopyOutFromIter(ars hostarch.AddrRangeSeq, src safemem.Reader) (int64, error) {
+	return s.copyOutFromIter(ars, src, hemiGvisorRawRingEnter)
+}
+
+func (s *subprocess) copyOutFromIter(ars hostarch.AddrRangeSeq, src safemem.Reader, enterFn hemiGvisorRingEnterFunc) (int64, error) {
+	device, lane, mmHandle, err := s.hemiGvisorAcquireRingLane(ars)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { device.lanes <- lane }()
+
+	buf := lane.mapping[hemiGvisorRingDataOffset : hemiGvisorRingDataOffset+hemiGvisorRingBatchBytes]
+	var done int64
+	for !ars.IsEmpty() {
+		ar := ars.Head()
+		if ar.Length() == 0 {
+			ars = ars.Tail()
+			continue
+		}
+		want := min(int(ar.Length()), len(buf))
+		n64, srcErr := src.ReadToBlocks(safemem.BlockSeqOf(safemem.BlockFromSafeSlice(buf[:want])))
+		if n64 > uint64(want) {
+			return done, fmt.Errorf("reader returned %d bytes for a %d-byte ring buffer", n64, want)
+		}
+		n := int(n64)
+		if n != 0 {
+			copied, targetErr := s.hemiGvisorTransferRingInPlace(
+				device, lane, mmHandle, ar.Start, buf[:n], linux.HEMI_GVISOR_RING_OP_WRITE, enterFn)
+			done += int64(copied)
+			ars = ars.DropFirst(copied)
+			if targetErr != nil {
+				return done, targetErr
+			}
+			if copied != n {
+				return done, &platform.AddressSpaceIOStreamError{Err: fmt.Errorf("HEMI gVisor ring copied only %d/%d bytes without an error", copied, n)}
+			}
+		}
+		if srcErr != nil {
+			return done, srcErr
+		}
+		if n != want {
+			return done, nil
+		}
+	}
+	return done, nil
+}
+
+// CopyInToIter implements platform.AddressSpaceIOIter.CopyInToIter. The ring
+// lane receives HEMI-managed application memory and is passed directly to the
+// Writer without an intermediate MemoryManager buffer.
+func (s *subprocess) CopyInToIter(ars hostarch.AddrRangeSeq, dst safemem.Writer) (int64, error) {
+	return s.copyInToIter(ars, dst, hemiGvisorRawRingEnter)
+}
+
+func (s *subprocess) copyInToIter(ars hostarch.AddrRangeSeq, dst safemem.Writer, enterFn hemiGvisorRingEnterFunc) (int64, error) {
+	device, lane, mmHandle, err := s.hemiGvisorAcquireRingLane(ars)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { device.lanes <- lane }()
+
+	buf := lane.mapping[hemiGvisorRingDataOffset : hemiGvisorRingDataOffset+hemiGvisorRingBatchBytes]
+	var done int64
+	for !ars.IsEmpty() {
+		ar := ars.Head()
+		if ar.Length() == 0 {
+			ars = ars.Tail()
+			continue
+		}
+		want := min(int(ar.Length()), len(buf))
+		copied, targetErr := s.hemiGvisorTransferRingInPlace(
+			device, lane, mmHandle, ar.Start, buf[:want], linux.HEMI_GVISOR_RING_OP_READ, enterFn)
+		if copied == 0 {
+			if targetErr == nil {
+				targetErr = &platform.AddressSpaceIOStreamError{Err: fmt.Errorf("HEMI gVisor ring copied 0/%d bytes without an error", want)}
+			}
+			return done, targetErr
+		}
+
+		written64, writeErr := dst.WriteFromBlocks(safemem.BlockSeqOf(safemem.BlockFromSafeSlice(buf[:copied])))
+		if written64 > uint64(copied) {
+			return done, fmt.Errorf("writer consumed %d bytes from a %d-byte ring buffer", written64, copied)
+		}
+		written := int(written64)
+		done += int64(written)
+		ars = ars.DropFirst(written)
+		if writeErr != nil {
+			return done, writeErr
+		}
+		if targetErr != nil {
+			return done, targetErr
+		}
+		if written != copied {
+			return done, nil
+		}
+		if copied != want {
+			return done, &platform.AddressSpaceIOStreamError{Err: fmt.Errorf("HEMI gVisor ring copied only %d/%d bytes without an error", copied, want)}
+		}
+	}
+	return done, nil
 }
 
 // EnsureAccess faults in and validates a HEMI-managed user range without

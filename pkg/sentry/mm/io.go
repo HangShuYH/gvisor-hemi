@@ -159,6 +159,27 @@ func (mm *MemoryManager) asioApplicableToAny(ars hostarch.AddrRangeSeq) bool {
 	return false
 }
 
+func (mm *MemoryManager) asioApplicabilityForSeq(ars hostarch.AddrRangeSeq) (all, any bool) {
+	all = true
+	for !ars.IsEmpty() {
+		ar := ars.Head()
+		for ar.Length() != 0 {
+			prefix, applicable := mm.asioPrefix(ar)
+			if applicable {
+				any = true
+			} else {
+				all = false
+			}
+			if any && !all {
+				return all, any
+			}
+			ar.Start = prefix.End
+		}
+		ars = ars.Tail()
+	}
+	return all, any
+}
+
 // asioApplicabilityForAtomic returns whether all or any of ar requires
 // AddressSpaceIO. A mixed result cannot be serviced atomically by either path.
 func (mm *MemoryManager) asioApplicabilityForAtomic(ar hostarch.AddrRange) (all, any bool) {
@@ -570,8 +591,29 @@ func (mm *MemoryManager) CopyOutFromIter(ctx context.Context, ars hostarch.AddrR
 		return 0, nil
 	}
 
-	if !mm.asioEnabledForSize(opts, uint64(ars.NumBytes()), rwMapMinBytes) || !mm.asioApplicableToAny(ars) {
+	total := ars.NumBytes()
+	if !mm.asioEnabledForSize(opts, uint64(total), rwMapMinBytes) {
 		return mm.withVecInternalMappings(ctx, ars, hostarch.Write, opts.IgnorePermissions, src.ReadToBlocks)
+	}
+	allASIO, anyASIO := mm.asioApplicabilityForSeq(ars)
+	if !anyASIO {
+		return mm.withVecInternalMappings(ctx, ars, hostarch.Write, opts.IgnorePermissions, src.ReadToBlocks)
+	}
+	if stream, ok := mm.as.(platform.AddressSpaceIOIter); ok && allASIO {
+		n, err := stream.CopyOutFromIter(ars, src)
+		if n < 0 || n > total {
+			return 0, translateIOError(ctx, fmt.Errorf("AddressSpaceIO stream copied %d/%d bytes", n, total))
+		}
+		if _, unavailable := err.(platform.AddressSpaceIOUnavailable); unavailable {
+			if n != 0 {
+				return n, translateIOError(ctx, fmt.Errorf("AddressSpaceIO stream became unavailable after copying %d bytes", n))
+			}
+		} else {
+			if _, targetErr := err.(*platform.AddressSpaceIOStreamError); targetErr {
+				return n, translateIOError(ctx, err)
+			}
+			return n, err
+		}
 	}
 
 	bufPtr, pool, size := mm.getIterIOBuf()
@@ -595,8 +637,29 @@ func (mm *MemoryManager) CopyInToIter(ctx context.Context, ars hostarch.AddrRang
 		return 0, nil
 	}
 
-	if !mm.asioReadEnabledForSize(opts, uint64(ars.NumBytes()), rwMapMinBytes) || !mm.asioApplicableToAny(ars) {
+	total := ars.NumBytes()
+	if !mm.asioReadEnabledForSize(opts, uint64(total), rwMapMinBytes) {
 		return mm.withVecInternalMappings(ctx, ars, hostarch.Read, opts.IgnorePermissions, dst.WriteFromBlocks)
+	}
+	allASIO, anyASIO := mm.asioApplicabilityForSeq(ars)
+	if !anyASIO {
+		return mm.withVecInternalMappings(ctx, ars, hostarch.Read, opts.IgnorePermissions, dst.WriteFromBlocks)
+	}
+	if stream, ok := mm.as.(platform.AddressSpaceIOIter); ok && allASIO {
+		n, err := stream.CopyInToIter(ars, dst)
+		if n < 0 || n > total {
+			return 0, translateIOError(ctx, fmt.Errorf("AddressSpaceIO stream copied %d/%d bytes", n, total))
+		}
+		if _, unavailable := err.(platform.AddressSpaceIOUnavailable); unavailable {
+			if n != 0 {
+				return n, translateIOError(ctx, fmt.Errorf("AddressSpaceIO stream became unavailable after copying %d bytes", n))
+			}
+		} else {
+			if _, targetErr := err.(*platform.AddressSpaceIOStreamError); targetErr {
+				return n, translateIOError(ctx, err)
+			}
+			return n, err
+		}
 	}
 
 	bufPtr, pool, size := mm.getIterIOBuf()

@@ -888,7 +888,7 @@ func (i *inode) readFromBuf(ctx context.Context, dst *usermem.IOSequence) (int64
 
 func readFromHostFD(ctx context.Context, hostFD int, dst usermem.IOSequence, offset int64, flags uint32) (int64, error) {
 	reader := hostfd.GetReadWriterAt(int32(hostFD), offset, flags)
-	n, err := dst.CopyOutFrom(ctx, reader)
+	n, err := dst.CopyOutFromIter(ctx, reader)
 	hostfd.PutReadWriterAt(reader)
 	return int64(n), err
 }
@@ -942,7 +942,7 @@ func (f *fileDescription) writeToHostFD(ctx context.Context, src usermem.IOSeque
 		return 0, linuxerr.EOPNOTSUPP
 	}
 	writer := hostfd.GetReadWriterAt(int32(hostFD), offset, flags)
-	n, err := src.CopyInTo(ctx, writer)
+	n, err := src.CopyInToIter(ctx, writer)
 	hostfd.PutReadWriterAt(writer)
 	// NOTE(gvisor.dev/issue/2979): We always sync everything, even for O_DSYNC.
 	if n > 0 && f.vfsfd.StatusFlags()&(linux.O_DSYNC|linux.O_SYNC) != 0 {

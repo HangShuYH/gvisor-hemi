@@ -93,6 +93,7 @@ go_library(
         "//pkg/rand",
         "//pkg/refs",
         "//pkg/safecopy",
+        "//pkg/safemem",
         "//pkg/seccomp",
         "//pkg/seccomp/precompiledseccomp",
         "//pkg/sentry/arch",

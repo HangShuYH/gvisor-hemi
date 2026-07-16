@@ -521,7 +521,7 @@ func (fd *regularFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 	// memCgID can be 0 here because regularFileReadWriter.ReadToBlocks() never
 	// allocates from pgalloc.
 	rw := getRegularFileReadWriter(f, offset, 0)
-	n, err := dst.CopyOutFrom(ctx, rw)
+	n, err := dst.CopyOutFromIter(ctx, rw)
 	putRegularFileReadWriter(rw)
 	fd.inode().touchAtime(fd.vfsfd.Mount())
 	return n, err
@@ -583,7 +583,7 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 
 	// Perform the write.
 	rw := getRegularFileReadWriter(f, offset, pgalloc.MemoryCgroupIDFromContext(ctx))
-	n, err := src.CopyInTo(ctx, rw)
+	n, err := src.CopyInToIter(ctx, rw)
 
 	f.inode.touchCMtimeLocked()
 	for {
