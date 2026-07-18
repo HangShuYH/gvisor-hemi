@@ -24,6 +24,7 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
+	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/hostsyscall"
 	"gvisor.dev/gvisor/pkg/log"
@@ -173,6 +174,10 @@ type subprocess struct {
 	// Host's per-mm serialization and ensures that a pooled address space can't
 	// be reset while a portal request is in flight.
 	hemiGvisorPortalMu sync.Mutex
+	// hemiGvisorAtomicPortal pins the Host mm for the lifetime of this pooled
+	// subprocess, removing per-atomic handle lookup and mmget/mmput overhead.
+	hemiGvisorAtomicPortal              *fd.FD
+	hemiGvisorAtomicPortalBindAttempted bool
 	// hemiGvisorDevice is the device instance to which hemiGvisorMMHandle
 	// belongs. It persists while an address space is pooled so that a handle is
 	// never reused against a replacement device instance.
@@ -527,6 +532,7 @@ func (s *subprocess) unmap() {
 func (s *subprocess) Release() {
 	s.hemiGvisorReleaseAddressSpace()
 	if !s.alive() {
+		s.hemiGvisorDestroyAddressSpace()
 		return
 	}
 	s.unmap()
@@ -539,6 +545,7 @@ func (s *subprocess) release() {
 		globalPool.markAvailable(s)
 		return
 	}
+	s.hemiGvisorDestroyAddressSpace()
 	if s.syscallThread != nil && s.syscallThread.seccompNotify != nil {
 		s.syscallThread.seccompNotify.Close()
 	}

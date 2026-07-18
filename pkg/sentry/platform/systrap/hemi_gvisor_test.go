@@ -211,6 +211,31 @@ func TestHemiGvisorRingABILayout(t *testing.T) {
 	if got, want := unsafe.Offsetof(enter.Reserved), uintptr(24); got != want {
 		t.Fatalf("offsetof(HemiGvisorRingEnter.Reserved) = %d, want %d", got, want)
 	}
+
+	bind := linux.HemiGvisorBindMM{}
+	if got, want := unsafe.Sizeof(bind), uintptr(16); got != want {
+		t.Fatalf("sizeof(HemiGvisorBindMM) = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(bind.PortalFD), uintptr(12); got != want {
+		t.Fatalf("offsetof(HemiGvisorBindMM.PortalFD) = %d, want %d", got, want)
+	}
+}
+
+func TestHemiGvisorRingTransferThreshold(t *testing.T) {
+	for _, test := range []struct {
+		length int
+		want   bool
+	}{
+		{length: 0, want: false},
+		{length: 4, want: false},
+		{length: hemiGvisorRingMinBytes - 1, want: false},
+		{length: hemiGvisorRingMinBytes, want: true},
+		{length: hemiGvisorRingSlotBytes, want: true},
+	} {
+		if got := hemiGvisorUseRing(test.length); got != test.want {
+			t.Errorf("hemiGvisorUseRing(%d) = %t, want %t", test.length, got, test.want)
+		}
+	}
 }
 
 func newTestHemiGvisorRingLane() *hemiGvisorRingLane {

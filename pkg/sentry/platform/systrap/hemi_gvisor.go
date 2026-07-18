@@ -53,6 +53,10 @@ const (
 	hemiGvisorRingSlotBytes        = hemiGvisorRingDataStride
 	hemiGvisorRingMapSize          = hemiGvisorRingDataOffset + hemiGvisorRingEntries*hemiGvisorRingDataStride
 	hemiGvisorRingBatchBytes       = hemiGvisorRingEntries * hemiGvisorRingSlotBytes
+	// Small portal operations are cheaper through the legacy ioctl, which
+	// avoids ring lane acquisition and descriptor validation. This threshold
+	// keeps syscall metadata and futex-adjacent copies off the batching path.
+	hemiGvisorRingMinBytes = 256
 )
 
 var hemiGvisorZeroBuffer [hemiGvisorRingBatchBytes]byte
@@ -291,8 +295,12 @@ func (l *hemiGvisorRingLane) transferData(deviceFD int32, mmHandle uint64, addr 
 	return done, nil
 }
 
+func hemiGvisorUseRing(length int) bool {
+	return length >= hemiGvisorRingMinBytes
+}
+
 func (d *hemiGvisorDeviceState) tryRingTransfer(mmHandle uint64, addr hostarch.Addr, data []byte, op uint16) (int, error, bool) {
-	if d == nil || d.lanes == nil {
+	if d == nil || d.lanes == nil || !hemiGvisorUseRing(len(data)) {
 		return 0, nil, false
 	}
 	select {
@@ -329,6 +337,10 @@ func (s *subprocess) hemiGvisorInitAddressSpace() error {
 		s.hemiGvisorTGID = 0
 		return err
 	}
+	if err := s.hemiGvisorBindAtomicPortalLocked(); err != nil {
+		s.hemiGvisorTGID = 0
+		return err
+	}
 	return nil
 }
 
@@ -336,6 +348,20 @@ func (s *subprocess) hemiGvisorReleaseAddressSpace() {
 	s.hemiGvisorPortalMu.Lock()
 	defer s.hemiGvisorPortalMu.Unlock()
 	s.hemiGvisorTGID = 0
+}
+
+// hemiGvisorDestroyAddressSpace releases resources that intentionally persist
+// while a live subprocess is pooled for reuse.
+func (s *subprocess) hemiGvisorDestroyAddressSpace() {
+	s.hemiGvisorPortalMu.Lock()
+	portal := s.hemiGvisorAtomicPortal
+	s.hemiGvisorAtomicPortal = nil
+	s.hemiGvisorAtomicPortalBindAttempted = false
+	s.hemiGvisorTGID = 0
+	s.hemiGvisorPortalMu.Unlock()
+	if portal != nil {
+		_ = portal.Close()
+	}
 }
 
 // hemiGvisorResetMMLocked resets s's Host-managed address-space state.
@@ -365,6 +391,41 @@ func (s *subprocess) hemiGvisorResetMMLocked() error {
 		return fmt.Errorf("HEMI gVisor reset mm ioctl returned an empty handle")
 	}
 	s.hemiGvisorMMHandle = req.MMHandle
+	return nil
+}
+
+// hemiGvisorBindAtomicPortalLocked pins the Host mm behind the persistent
+// handle once. Binding is an optional optimization: if the adaptor rejects it
+// or cannot allocate the portal, atomic operations retain the handle-based
+// ioctl fallback.
+//
+// Preconditions: s.hemiGvisorPortalMu is locked.
+func (s *subprocess) hemiGvisorBindAtomicPortalLocked() error {
+	if s.hemiGvisorAtomicPortal != nil || s.hemiGvisorAtomicPortalBindAttempted {
+		return nil
+	}
+	device := s.hemiGvisorDevice
+	if device == nil || s.hemiGvisorMMHandle == 0 {
+		return nil
+	}
+	s.hemiGvisorAtomicPortalBindAttempted = true
+	req := linux.HemiGvisorBindMM{
+		MMHandle: s.hemiGvisorMMHandle,
+		PortalFD: -1,
+	}
+	errno := hostsyscall.RawSyscallErrno6(
+		unix.SYS_IOCTL, uintptr(device.fd), uintptr(linux.HEMI_GVISOR_BIND_MM),
+		uintptr(unsafe.Pointer(&req)), 0, 0, 0)
+	if errno != 0 {
+		return nil
+	}
+	if req.MMHandle != s.hemiGvisorMMHandle || req.Flags != 0 || req.PortalFD < 0 {
+		if req.PortalFD >= 0 {
+			_ = unix.Close(int(req.PortalFD))
+		}
+		return fmt.Errorf("HEMI gVisor bind mm ioctl returned invalid binding: %+v", req)
+	}
+	s.hemiGvisorAtomicPortal = fd.New(int(req.PortalFD))
 	return nil
 }
 
@@ -879,8 +940,12 @@ func (s *subprocess) hemiGvisorAtomicUint32(addr hostarch.Addr, op, old, new uin
 		Old:      old,
 		New:      new,
 	}
+	atomicFD := device.fd
+	if s.hemiGvisorAtomicPortal != nil {
+		atomicFD = int32(s.hemiGvisorAtomicPortal.FD())
+	}
 	errno := hostsyscall.RawSyscallErrno6(
-		unix.SYS_IOCTL, uintptr(device.fd), uintptr(linux.HEMI_GVISOR_ATOMIC_U32),
+		unix.SYS_IOCTL, uintptr(atomicFD), uintptr(linux.HEMI_GVISOR_ATOMIC_U32),
 		uintptr(unsafe.Pointer(&req)), 0, 0, 0)
 	if errno == 0 {
 		return req.Value, nil
