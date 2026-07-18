@@ -21,6 +21,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	"gvisor.dev/gvisor/pkg/sentry/platform"
 )
 
 // InvalidateUnsavable invokes memmap.Mappable.InvalidateUnsavable on all
@@ -46,6 +47,12 @@ func (mm *MemoryManager) afterLoad(ctx goContext.Context) {
 		as, err := mm.p.NewAddressSpace()
 		if err != nil {
 			panic(fmt.Sprintf("failed to create AddressSpace after restore: %v", err))
+		}
+		if initializer, ok := as.(platform.AddressSpaceInitializer); ok {
+			if err := initializer.InitializeAddressSpace(); err != nil {
+				as.Release()
+				panic(fmt.Sprintf("failed to initialize AddressSpace after restore: %v", err))
+			}
 		}
 		mm.as = as
 		mm.reservedAR = addressSpaceReservedRange(as)

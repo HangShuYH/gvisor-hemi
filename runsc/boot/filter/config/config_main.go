@@ -116,12 +116,17 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 	unix.SYS_IOCTL: seccomp.Or{
 		seccomp.PerArg{
 			seccomp.NonNegativeFD{},
-			seccomp.EqualTo(linux.HEMI_GVISOR_RESET_MM),
+			seccomp.EqualTo(linux.HEMI_GVISOR_ALLOC_MM),
 			seccomp.AnyValue{},
 		},
 		seccomp.PerArg{
 			seccomp.NonNegativeFD{},
 			seccomp.EqualTo(linux.HEMI_GVISOR_FORK_MM),
+			seccomp.AnyValue{},
+		},
+		seccomp.PerArg{
+			seccomp.NonNegativeFD{},
+			seccomp.EqualTo(linux.HEMI_GVISOR_FREE_MM),
 			seccomp.AnyValue{},
 		},
 		seccomp.PerArg{

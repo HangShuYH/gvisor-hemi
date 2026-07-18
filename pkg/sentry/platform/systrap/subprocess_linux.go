@@ -58,8 +58,8 @@ func attachedThread(flags uintptr, defaultAction seccomp.Action) (*thread, error
 			Rules: seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 				unix.SYS_CLONE: seccomp.Or{
 					// Allow creation of new subprocesses (used by the master).
-					seccomp.PerArg{seccomp.EqualTo(unix.CLONE_FILES | unix.CLONE_PARENT | linux.CLONE_HEMI | unix.SIGCHLD)},
-					seccomp.PerArg{seccomp.EqualTo(unix.CLONE_FILES | linux.CLONE_HEMI | unix.SIGCHLD)},
+					seccomp.PerArg{seccomp.EqualTo(unix.CLONE_FILES | unix.CLONE_PARENT | unix.SIGCHLD)},
+					seccomp.PerArg{seccomp.EqualTo(unix.CLONE_FILES | unix.SIGCHLD)},
 					// Allow creation of new sysmsg thread.
 					seccomp.PerArg{seccomp.EqualTo(
 						unix.CLONE_FILES |
@@ -274,7 +274,7 @@ func (t *thread) createStub() (*thread, error) {
 	pid, err := t.syscallIgnoreInterrupt(
 		&regs,
 		unix.SYS_CLONE,
-		arch.SyscallArgument{Value: uintptr(unix.CLONE_FILES | unix.CLONE_PARENT | linux.CLONE_HEMI | uintptr(unix.SIGCHLD))},
+		arch.SyscallArgument{Value: uintptr(unix.CLONE_FILES | unix.CLONE_PARENT | uintptr(unix.SIGCHLD))},
 		arch.SyscallArgument{Value: 0},
 		arch.SyscallArgument{Value: 0},
 		arch.SyscallArgument{Value: 0},

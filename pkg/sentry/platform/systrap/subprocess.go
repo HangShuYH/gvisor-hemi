@@ -163,11 +163,12 @@ type subprocess struct {
 	syscallThreadMu sync.Mutex
 	syscallThread   *syscallThread
 
-	// hemiGvisorTGID identifies this subprocess during initial HEMI binding and
-	// marks it active while the AddressSpace is checked out of the pool.
+	// hemiGvisorTGID identifies the Host subprocess prepared for this
+	// AddressSpace. It is cleared before the subprocess returns to the pool.
 	hemiGvisorTGID int32
-	// hemiGvisorMMHandle is the stable Host handle returned when this
-	// subprocess is first attached to HEMI. It remains valid across pool resets.
+	// hemiGvisorMMHandle identifies HEMI state for the current AddressSpace only.
+	// A successful FREE_MM clears it before normal pool reuse; an unexpected
+	// FREE_MM failure retains it so the next acquire rejects this subprocess.
 	hemiGvisorMMHandle uint64
 	// hemiGvisorPortalMu serializes HEMI address-space lifecycle operations
 	// with user-memory, probe, and atomic portal operations. This matches the
@@ -178,9 +179,8 @@ type subprocess struct {
 	// subprocess, removing per-atomic handle lookup and mmget/mmput overhead.
 	hemiGvisorAtomicPortal              *fd.FD
 	hemiGvisorAtomicPortalBindAttempted bool
-	// hemiGvisorDevice is the device instance to which hemiGvisorMMHandle
-	// belongs. It persists while an address space is pooled so that a handle is
-	// never reused against a replacement device instance.
+	// hemiGvisorDevice is the device instance controlling the current
+	// AddressSpace lifetime, or a failed FREE_MM retry.
 	hemiGvisorDevice *hemiGvisorDeviceState
 
 	// sysmsgThreadsMu protects sysmsgThreads

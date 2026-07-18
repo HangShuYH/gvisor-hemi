@@ -219,6 +219,25 @@ func TestHemiGvisorRingABILayout(t *testing.T) {
 	if got, want := unsafe.Offsetof(bind.PortalFD), uintptr(12); got != want {
 		t.Fatalf("offsetof(HemiGvisorBindMM.PortalFD) = %d, want %d", got, want)
 	}
+
+	alloc := linux.HemiGvisorAllocMM{}
+	if got, want := unsafe.Sizeof(alloc), uintptr(24); got != want {
+		t.Fatalf("sizeof(HemiGvisorAllocMM) = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(alloc.MMHandle), uintptr(16); got != want {
+		t.Fatalf("offsetof(HemiGvisorAllocMM.MMHandle) = %d, want %d", got, want)
+	}
+
+	fork := linux.HemiGvisorForkMM{}
+	if got, want := unsafe.Sizeof(fork), uintptr(32); got != want {
+		t.Fatalf("sizeof(HemiGvisorForkMM) = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(fork.ChildMMHandle), uintptr(24); got != want {
+		t.Fatalf("offsetof(HemiGvisorForkMM.ChildMMHandle) = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Sizeof(linux.HemiGvisorFreeMM{}), uintptr(16); got != want {
+		t.Fatalf("sizeof(HemiGvisorFreeMM) = %d, want %d", got, want)
+	}
 }
 
 func TestHemiGvisorRingTransferThreshold(t *testing.T) {

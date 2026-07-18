@@ -33,6 +33,12 @@ func NewMemoryManager(p platform.Platform, mf *pgalloc.MemoryFile) (*MemoryManag
 	if err != nil {
 		return nil, err
 	}
+	if initializer, ok := as.(platform.AddressSpaceInitializer); ok {
+		if err := initializer.InitializeAddressSpace(); err != nil {
+			as.Release()
+			return nil, err
+		}
+	}
 	return &MemoryManager{
 		p:           p,
 		mf:          mf,
@@ -70,6 +76,11 @@ func (mm *MemoryManager) Fork(ctx context.Context) (*MemoryManager, error) {
 	defer mm.AddressSpace().PostFork()
 	if forker, ok := as.(platform.AddressSpaceForker); ok {
 		if err := forker.ForkAddressSpaceFrom(mm.AddressSpace()); err != nil {
+			as.Release()
+			return nil, err
+		}
+	} else if initializer, ok := as.(platform.AddressSpaceInitializer); ok {
+		if err := initializer.InitializeAddressSpace(); err != nil {
 			as.Release()
 			return nil, err
 		}

@@ -47,15 +47,17 @@ var (
 	HEMI_GVISOR_MAP_FILE = IOW(HEMI_GVISOR_IOCTL_TYPE, 0x01, uint32((*HemiGvisorMapFile)(nil).SizeBytes()))
 )
 
-// HemiGvisorResetMM is struct hemi_gvisor_reset_mm from
+// HemiGvisorAllocMM is struct hemi_gvisor_alloc_mm from
 // include/uapi/linux/hemi_gvisor.h.
 //
 // +marshal
-type HemiGvisorResetMM struct {
-	_          structs.HostLayout
-	TargetTGID int32
-	Flags      uint32
-	MMHandle   uint64
+type HemiGvisorAllocMM struct {
+	_              structs.HostLayout
+	TargetTGID     int32
+	TargetDeviceFD int32
+	Flags          uint32
+	Reserved       uint32
+	MMHandle       uint64
 }
 
 // HemiGvisorForkMM is struct hemi_gvisor_fork_mm from
@@ -65,14 +67,28 @@ type HemiGvisorResetMM struct {
 type HemiGvisorForkMM struct {
 	_              structs.HostLayout
 	ParentMMHandle uint64
-	ChildMMHandle  uint64
+	TargetTGID     int32
+	TargetDeviceFD int32
 	Flags          uint32
 	Reserved       uint32
+	ChildMMHandle  uint64
+}
+
+// HemiGvisorFreeMM is struct hemi_gvisor_free_mm from
+// include/uapi/linux/hemi_gvisor.h.
+//
+// +marshal
+type HemiGvisorFreeMM struct {
+	_        structs.HostLayout
+	MMHandle uint64
+	Flags    uint32
+	Reserved uint32
 }
 
 var (
-	HEMI_GVISOR_RESET_MM = IOWR(HEMI_GVISOR_IOCTL_TYPE, 0x02, uint32((*HemiGvisorResetMM)(nil).SizeBytes()))
-	HEMI_GVISOR_FORK_MM  = IOW(HEMI_GVISOR_IOCTL_TYPE, 0x03, uint32((*HemiGvisorForkMM)(nil).SizeBytes()))
+	HEMI_GVISOR_ALLOC_MM = IOWR(HEMI_GVISOR_IOCTL_TYPE, 0x02, uint32((*HemiGvisorAllocMM)(nil).SizeBytes()))
+	HEMI_GVISOR_FORK_MM  = IOWR(HEMI_GVISOR_IOCTL_TYPE, 0x03, uint32((*HemiGvisorForkMM)(nil).SizeBytes()))
+	HEMI_GVISOR_FREE_MM  = IOW(HEMI_GVISOR_IOCTL_TYPE, 0x04, uint32((*HemiGvisorFreeMM)(nil).SizeBytes()))
 )
 
 // HemiGvisorUserMem is struct hemi_gvisor_user_mem from

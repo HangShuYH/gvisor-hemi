@@ -402,6 +402,14 @@ type AddressSpaceForker interface {
 	ForkAddressSpaceFrom(source AddressSpace) error
 }
 
+// AddressSpaceInitializer is implemented by AddressSpaces whose platform state
+// for a new, empty guest address space must be created explicitly. Fork creates
+// destination state through AddressSpaceForker instead, so the two operations
+// are mutually exclusive for a given AddressSpace lifetime.
+type AddressSpaceInitializer interface {
+	InitializeAddressSpace() error
+}
+
 // AddressSpaceIO supports IO through the memory mappings installed in an
 // AddressSpace.
 //

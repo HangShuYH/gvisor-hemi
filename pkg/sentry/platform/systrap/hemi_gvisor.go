@@ -28,6 +28,7 @@ import (
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/hostsyscall"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/memutil"
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
@@ -61,7 +62,11 @@ const (
 
 var hemiGvisorZeroBuffer [hemiGvisorRingBatchBytes]byte
 
-var _ platform.AddressSpaceIOIter = (*subprocess)(nil)
+var (
+	_ platform.AddressSpaceInitializer = (*subprocess)(nil)
+	_ platform.AddressSpaceForker      = (*subprocess)(nil)
+	_ platform.AddressSpaceIOIter      = (*subprocess)(nil)
+)
 
 type hemiGvisorRingEnterFunc func(int32, *linux.HemiGvisorRingEnter) unix.Errno
 
@@ -313,7 +318,10 @@ func (d *hemiGvisorDeviceState) tryRingTransfer(mmHandle uint64, addr hostarch.A
 	}
 }
 
-func (s *subprocess) hemiGvisorInitAddressSpace() error {
+// hemiGvisorPrepareAddressSpace records the unbound Host subprocess selected
+// for this AddressSpace. HEMI state is created later by either
+// InitializeAddressSpace or ForkAddressSpaceFrom.
+func (s *subprocess) hemiGvisorPrepareAddressSpace() error {
 	device := hemiGvisorCurrentDevice()
 	if device == nil {
 		return nil
@@ -328,17 +336,28 @@ func (s *subprocess) hemiGvisorInitAddressSpace() error {
 
 	s.hemiGvisorPortalMu.Lock()
 	defer s.hemiGvisorPortalMu.Unlock()
-	if s.hemiGvisorMMHandle != 0 && s.hemiGvisorDevice != nil && s.hemiGvisorDevice != device {
-		return fmt.Errorf("HEMI gVisor mm handle %d belongs to a different device instance", s.hemiGvisorMMHandle)
+	if s.hemiGvisorMMHandle != 0 || s.hemiGvisorAtomicPortal != nil {
+		return fmt.Errorf("HEMI gVisor pooled subprocess still has active state: handle=%d portal=%v",
+			s.hemiGvisorMMHandle, s.hemiGvisorAtomicPortal != nil)
 	}
 	s.hemiGvisorDevice = device
 	s.hemiGvisorTGID = int32(t.thread.tgid)
-	if err := s.hemiGvisorResetMMLocked(); err != nil {
-		s.hemiGvisorTGID = 0
+	return nil
+}
+
+// InitializeAddressSpace implements platform.AddressSpaceInitializer for a new,
+// empty guest address space.
+func (s *subprocess) InitializeAddressSpace() error {
+	s.hemiGvisorPortalMu.Lock()
+	defer s.hemiGvisorPortalMu.Unlock()
+	if s.hemiGvisorDevice == nil {
+		return nil
+	}
+	if err := s.hemiGvisorAllocMMLocked(); err != nil {
 		return err
 	}
 	if err := s.hemiGvisorBindAtomicPortalLocked(); err != nil {
-		s.hemiGvisorTGID = 0
+		_ = s.hemiGvisorFreeMMLocked()
 		return err
 	}
 	return nil
@@ -347,50 +366,81 @@ func (s *subprocess) hemiGvisorInitAddressSpace() error {
 func (s *subprocess) hemiGvisorReleaseAddressSpace() {
 	s.hemiGvisorPortalMu.Lock()
 	defer s.hemiGvisorPortalMu.Unlock()
-	s.hemiGvisorTGID = 0
-}
-
-// hemiGvisorDestroyAddressSpace releases resources that intentionally persist
-// while a live subprocess is pooled for reuse.
-func (s *subprocess) hemiGvisorDestroyAddressSpace() {
-	s.hemiGvisorPortalMu.Lock()
-	portal := s.hemiGvisorAtomicPortal
-	s.hemiGvisorAtomicPortal = nil
-	s.hemiGvisorAtomicPortalBindAttempted = false
-	s.hemiGvisorTGID = 0
-	s.hemiGvisorPortalMu.Unlock()
-	if portal != nil {
-		_ = portal.Close()
+	if err := s.hemiGvisorFreeMMLocked(); err != nil {
+		log.Warningf("HEMI gVisor failed to free AddressSpace: %v", err)
+		// Keep the target identity and handle so that a pooled subprocess
+		// cannot be mistaken for an empty AddressSpace. A subsequent acquire
+		// will reject it and Release will retry the idempotent FREE_MM.
+		return
 	}
+	s.hemiGvisorTGID = 0
+	s.hemiGvisorDevice = nil
 }
 
-// hemiGvisorResetMMLocked resets s's Host-managed address-space state.
+// hemiGvisorDestroyAddressSpace is idempotent with the normal Release path and
+// covers a subprocess that died before it could be returned to the pool.
+func (s *subprocess) hemiGvisorDestroyAddressSpace() {
+	s.hemiGvisorReleaseAddressSpace()
+}
+
+// hemiGvisorAllocMMLocked creates an empty Host-managed address-space state.
 //
 // Preconditions: s.hemiGvisorPortalMu is locked.
-func (s *subprocess) hemiGvisorResetMMLocked() error {
+func (s *subprocess) hemiGvisorAllocMMLocked() error {
 	device := s.hemiGvisorDevice
 	if device == nil {
 		return nil
 	}
-	if s.hemiGvisorTGID <= 0 {
-		return fmt.Errorf("HEMI gVisor reset has no target subprocess")
+	if s.hemiGvisorTGID <= 0 || s.hemiGvisorMMHandle != 0 {
+		return fmt.Errorf("HEMI gVisor alloc has invalid target/handle %d/%d",
+			s.hemiGvisorTGID, s.hemiGvisorMMHandle)
 	}
 
-	req := linux.HemiGvisorResetMM{MMHandle: s.hemiGvisorMMHandle}
-	if req.MMHandle == 0 {
-		req.TargetTGID = s.hemiGvisorTGID
+	req := linux.HemiGvisorAllocMM{
+		TargetTGID:     s.hemiGvisorTGID,
+		TargetDeviceFD: device.fd,
 	}
 	errno := hostsyscall.RawSyscallErrno6(
-		unix.SYS_IOCTL, uintptr(device.fd), uintptr(linux.HEMI_GVISOR_RESET_MM),
+		unix.SYS_IOCTL, uintptr(device.fd), uintptr(linux.HEMI_GVISOR_ALLOC_MM),
 		uintptr(unsafe.Pointer(&req)), 0, 0, 0)
 	if errno != 0 {
-		return fmt.Errorf("HEMI gVisor reset mm ioctl for tgid %d: %w",
+		return fmt.Errorf("HEMI gVisor alloc mm ioctl for tgid %d: %w",
 			s.hemiGvisorTGID, errno)
 	}
 	if req.MMHandle == 0 {
-		return fmt.Errorf("HEMI gVisor reset mm ioctl returned an empty handle")
+		return fmt.Errorf("HEMI gVisor alloc mm ioctl returned an empty handle")
 	}
 	s.hemiGvisorMMHandle = req.MMHandle
+	return nil
+}
+
+// hemiGvisorFreeMMLocked revokes portals and releases all Host state for the
+// current AddressSpace. FREE_MM is idempotent in the Host adaptor.
+//
+// Preconditions: s.hemiGvisorPortalMu is locked.
+func (s *subprocess) hemiGvisorFreeMMLocked() error {
+	portal := s.hemiGvisorAtomicPortal
+	s.hemiGvisorAtomicPortal = nil
+	s.hemiGvisorAtomicPortalBindAttempted = false
+	if portal != nil {
+		_ = portal.Close()
+	}
+	device := s.hemiGvisorDevice
+	mmHandle := s.hemiGvisorMMHandle
+	if mmHandle == 0 {
+		return nil
+	}
+	if device == nil {
+		return fmt.Errorf("HEMI gVisor handle %d has no control device", mmHandle)
+	}
+	req := linux.HemiGvisorFreeMM{MMHandle: mmHandle}
+	errno := hostsyscall.RawSyscallErrno6(
+		unix.SYS_IOCTL, uintptr(device.fd), uintptr(linux.HEMI_GVISOR_FREE_MM),
+		uintptr(unsafe.Pointer(&req)), 0, 0, 0)
+	if errno != 0 {
+		return fmt.Errorf("HEMI gVisor free mm ioctl for handle %d: %w", mmHandle, errno)
+	}
+	s.hemiGvisorMMHandle = 0
 	return nil
 }
 
@@ -429,8 +479,8 @@ func (s *subprocess) hemiGvisorBindAtomicPortalLocked() error {
 	return nil
 }
 
-// ForkAddressSpaceFrom implements platform.AddressSpaceForker. It replaces
-// this subprocess's empty or pooled HEMI state with a COW fork of source.
+// ForkAddressSpaceFrom implements platform.AddressSpaceForker. The destination
+// subprocess is still unbound, so FORK_MM creates its first HEMI state directly.
 func (s *subprocess) ForkAddressSpaceFrom(source platform.AddressSpace) error {
 	parent, ok := source.(*subprocess)
 	if !ok {
@@ -445,21 +495,30 @@ func (s *subprocess) ForkAddressSpaceFrom(source platform.AddressSpace) error {
 	if parent.hemiGvisorDevice == nil || parent.hemiGvisorDevice != s.hemiGvisorDevice {
 		return fmt.Errorf("HEMI gVisor fork uses different parent and child devices")
 	}
-	if !parent.hemiGvisorActive() || !s.hemiGvisorActive() {
-		return fmt.Errorf("HEMI gVisor fork has invalid parent/child handle %d/%d",
-			parent.hemiGvisorMMHandle, s.hemiGvisorMMHandle)
+	if !parent.hemiGvisorActive() || s.hemiGvisorTGID <= 0 || s.hemiGvisorMMHandle != 0 {
+		return fmt.Errorf("HEMI gVisor fork has invalid parent/child state %d/%d/%d",
+			parent.hemiGvisorMMHandle, s.hemiGvisorTGID, s.hemiGvisorMMHandle)
 	}
 
 	req := linux.HemiGvisorForkMM{
 		ParentMMHandle: parent.hemiGvisorMMHandle,
-		ChildMMHandle:  s.hemiGvisorMMHandle,
+		TargetTGID:     s.hemiGvisorTGID,
+		TargetDeviceFD: s.hemiGvisorDevice.fd,
 	}
 	errno := hostsyscall.RawSyscallErrno6(
 		unix.SYS_IOCTL, uintptr(s.hemiGvisorDevice.fd), uintptr(linux.HEMI_GVISOR_FORK_MM),
 		uintptr(unsafe.Pointer(&req)), 0, 0, 0)
 	if errno != 0 {
-		return fmt.Errorf("HEMI gVisor fork mm ioctl for parent/child handle %d/%d: %w",
-			parent.hemiGvisorMMHandle, s.hemiGvisorMMHandle, errno)
+		return fmt.Errorf("HEMI gVisor fork mm ioctl for parent handle %d and child tgid %d: %w",
+			parent.hemiGvisorMMHandle, s.hemiGvisorTGID, errno)
+	}
+	if req.ChildMMHandle == 0 {
+		return fmt.Errorf("HEMI gVisor fork mm ioctl returned an empty child handle")
+	}
+	s.hemiGvisorMMHandle = req.ChildMMHandle
+	if err := s.hemiGvisorBindAtomicPortalLocked(); err != nil {
+		_ = s.hemiGvisorFreeMMLocked()
+		return err
 	}
 	return nil
 }

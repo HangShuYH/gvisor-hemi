@@ -183,6 +183,7 @@ go_test(
     name = "mm_test",
     size = "small",
     srcs = [
+        "address_space_initializer_test.go",
         "hemi_reservation_test.go",
         "io_asio_range_test.go",
         "io_iter_test.go",
