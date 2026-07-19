@@ -430,7 +430,8 @@ func (s *subprocess) hemiGvisorAllocMMLocked() error {
 }
 
 // hemiGvisorFreeMMLocked revokes portals and releases all Host state for the
-// current AddressSpace. FREE_MM is idempotent in the Host adaptor.
+// current AddressSpace. Its caller has already quiesced use of this AddressSpace;
+// the Host adaptor relies on that invariant and FREE_MM is idempotent.
 //
 // Preconditions: s.hemiGvisorPortalMu is locked.
 func (s *subprocess) hemiGvisorFreeMMLocked() error {
@@ -459,10 +460,10 @@ func (s *subprocess) hemiGvisorFreeMMLocked() error {
 	return nil
 }
 
-// hemiGvisorBindAtomicPortalLocked pins the Host mm behind the persistent
-// MMID once. Binding is an optional optimization: if the adaptor rejects it
-// or cannot allocate the portal, atomic operations retain the MMID-based
-// ioctl fallback.
+// hemiGvisorBindAtomicPortalLocked binds an optional portal fd to the current
+// HEMI guest and MMID. The Host resolves the MMID in HEMI core on every
+// operation, so FREE_MM also revokes an already-open portal. If binding is not
+// available, atomic operations retain the control-device ioctl fallback.
 //
 // Preconditions: s.hemiGvisorPortalMu is locked.
 func (s *subprocess) hemiGvisorBindAtomicPortalLocked() error {

@@ -171,12 +171,11 @@ type subprocess struct {
 	// FREE_MM failure retains it so the next acquire rejects this subprocess.
 	hemiGvisorMMID uint64
 	// hemiGvisorPortalMu serializes HEMI address-space lifecycle operations
-	// with user-memory, probe, and atomic portal operations. This matches the
-	// Host's per-mm serialization and ensures that a pooled address space can't
-	// be reset while a portal request is in flight.
+	// with user-memory, probe, and atomic portal operations, ensuring that a
+	// pooled address space can't be reset while a portal request is in flight.
 	hemiGvisorPortalMu sync.Mutex
-	// hemiGvisorAtomicPortal pins the Host mm for the lifetime of this pooled
-	// subprocess, removing per-atomic MMID lookup and mmget/mmput overhead.
+	// hemiGvisorAtomicPortal binds the Host guest and MMID without pinning
+	// adaptor-owned per-mm state; HEMI core validates the MMID on every call.
 	hemiGvisorAtomicPortal              *fd.FD
 	hemiGvisorAtomicPortalBindAttempted bool
 	// hemiGvisorDevice is the device instance controlling the current
