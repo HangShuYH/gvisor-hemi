@@ -166,17 +166,17 @@ type subprocess struct {
 	// hemiGvisorTGID identifies the Host subprocess prepared for this
 	// AddressSpace. It is cleared before the subprocess returns to the pool.
 	hemiGvisorTGID int32
-	// hemiGvisorMMHandle identifies HEMI state for the current AddressSpace only.
+	// hemiGvisorMMID identifies HEMI state for the current AddressSpace only.
 	// A successful FREE_MM clears it before normal pool reuse; an unexpected
 	// FREE_MM failure retains it so the next acquire rejects this subprocess.
-	hemiGvisorMMHandle uint64
+	hemiGvisorMMID uint64
 	// hemiGvisorPortalMu serializes HEMI address-space lifecycle operations
 	// with user-memory, probe, and atomic portal operations. This matches the
 	// Host's per-mm serialization and ensures that a pooled address space can't
 	// be reset while a portal request is in flight.
 	hemiGvisorPortalMu sync.Mutex
 	// hemiGvisorAtomicPortal pins the Host mm for the lifetime of this pooled
-	// subprocess, removing per-atomic handle lookup and mmget/mmput overhead.
+	// subprocess, removing per-atomic MMID lookup and mmget/mmput overhead.
 	hemiGvisorAtomicPortal              *fd.FD
 	hemiGvisorAtomicPortalBindAttempted bool
 	// hemiGvisorDevice is the device instance controlling the current

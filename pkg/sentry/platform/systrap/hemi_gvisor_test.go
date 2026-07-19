@@ -28,6 +28,24 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 )
 
+func TestHemiGvisorAllocateMMID(t *testing.T) {
+	device := &hemiGvisorDeviceState{}
+	for _, want := range []uint64{1, 2} {
+		got, err := device.allocateMMID()
+		if err != nil {
+			t.Fatalf("allocateMMID: %v", err)
+		}
+		if got != want {
+			t.Fatalf("allocateMMID = %d, want %d", got, want)
+		}
+	}
+
+	device.nextMMID = math.MaxUint64
+	if got, err := device.allocateMMID(); err == nil || got != 0 {
+		t.Fatalf("exhausted allocateMMID = (%d, %v), want (0, error)", got, err)
+	}
+}
+
 func TestHemiGvisorContainsUserMem(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -73,7 +91,7 @@ func TestHemiGvisorAddressSpaceIOApplicablePrefix(t *testing.T) {
 		{name: "above range", ar: hostarch.AddrRange{Start: end, End: end + 1}, wantLength: 1},
 	}
 
-	s := subprocess{hemiGvisorTGID: 1, hemiGvisorMMHandle: 1}
+	s := subprocess{hemiGvisorTGID: 1, hemiGvisorMMID: 1}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			gotLength, gotApplicable := s.AddressSpaceIOApplicablePrefix(test.ar)
@@ -92,7 +110,7 @@ func TestHemiGvisorAddressSpaceIOApplicablePrefix(t *testing.T) {
 
 func TestHemiGvisorKeepSyscallUnpatched(t *testing.T) {
 	inactive := subprocess{}
-	active := subprocess{hemiGvisorTGID: 1, hemiGvisorMMHandle: 1}
+	active := subprocess{hemiGvisorTGID: 1, hemiGvisorMMID: 1}
 	for _, sysno := range []uintptr{
 		unix.SYS_MMAP,
 		unix.SYS_MUNMAP,
@@ -224,16 +242,16 @@ func TestHemiGvisorRingABILayout(t *testing.T) {
 	if got, want := unsafe.Sizeof(alloc), uintptr(24); got != want {
 		t.Fatalf("sizeof(HemiGvisorAllocMM) = %d, want %d", got, want)
 	}
-	if got, want := unsafe.Offsetof(alloc.MMHandle), uintptr(16); got != want {
-		t.Fatalf("offsetof(HemiGvisorAllocMM.MMHandle) = %d, want %d", got, want)
+	if got, want := unsafe.Offsetof(alloc.MMID), uintptr(0); got != want {
+		t.Fatalf("offsetof(HemiGvisorAllocMM.MMID) = %d, want %d", got, want)
 	}
 
 	fork := linux.HemiGvisorForkMM{}
 	if got, want := unsafe.Sizeof(fork), uintptr(32); got != want {
 		t.Fatalf("sizeof(HemiGvisorForkMM) = %d, want %d", got, want)
 	}
-	if got, want := unsafe.Offsetof(fork.ChildMMHandle), uintptr(24); got != want {
-		t.Fatalf("offsetof(HemiGvisorForkMM.ChildMMHandle) = %d, want %d", got, want)
+	if got, want := unsafe.Offsetof(fork.ChildMMID), uintptr(8); got != want {
+		t.Fatalf("offsetof(HemiGvisorForkMM.ChildMMID) = %d, want %d", got, want)
 	}
 	if got, want := unsafe.Sizeof(linux.HemiGvisorFreeMM{}), uintptr(16); got != want {
 		t.Fatalf("sizeof(HemiGvisorFreeMM) = %d, want %d", got, want)
@@ -279,17 +297,17 @@ func TestHemiGvisorRingReadBatches(t *testing.T) {
 	lane := newTestHemiGvisorRingLane()
 	const (
 		deviceFD = int32(7)
-		mmHandle = uint64(23)
+		mmid     = uint64(23)
 		base     = hostarch.Addr(linux.HEMI_GVISOR_VMAR_START)
 	)
 	dst := make([]byte, hemiGvisorRingBatchBytes+123)
 	enterCalls := 0
 	totalDescriptors := 0
-	n, err := lane.transfer(deviceFD, mmHandle, base, dst, linux.HEMI_GVISOR_RING_OP_READ,
+	n, err := lane.transfer(deviceFD, mmid, base, dst, linux.HEMI_GVISOR_RING_OP_READ,
 		func(gotFD int32, enter *linux.HemiGvisorRingEnter) unix.Errno {
 			enterCalls++
-			if gotFD != deviceFD || enter.RingID != lane.ringID || enter.MMHandle != mmHandle || enter.Flags != 0 || enter.Reserved != 0 {
-				t.Errorf("ENTER = (fd:%d, %+v), want fd:%d ring:%d handle:%d", gotFD, *enter, deviceFD, lane.ringID, mmHandle)
+			if gotFD != deviceFD || enter.RingID != lane.ringID || enter.MMID != mmid || enter.Flags != 0 || enter.Reserved != 0 {
+				t.Errorf("ENTER = (fd:%d, %+v), want fd:%d ring:%d mmid:%d", gotFD, *enter, deviceFD, lane.ringID, mmid)
 			}
 			if enter.Count == 0 || enter.Count > hemiGvisorRingEntries {
 				t.Fatalf("ENTER count = %d, want 1..%d", enter.Count, hemiGvisorRingEntries)
@@ -462,7 +480,7 @@ func TestHemiGvisorAddressSpaceIOIterUsesRingBuffer(t *testing.T) {
 	lanes <- lane
 	const (
 		deviceFD = int32(3)
-		mmHandle = uint64(5)
+		mmid     = uint64(5)
 		base     = hostarch.Addr(linux.HEMI_GVISOR_VMAR_START)
 	)
 	length := hemiGvisorRingBatchBytes + 123
@@ -474,8 +492,8 @@ func TestHemiGvisorAddressSpaceIOIterUsesRingBuffer(t *testing.T) {
 	var ringWrite []byte
 	device := &hemiGvisorDeviceState{fd: deviceFD, lanes: lanes}
 	enterFn := func(gotFD int32, enter *linux.HemiGvisorRingEnter) unix.Errno {
-		if gotFD != deviceFD || enter.MMHandle != mmHandle {
-			t.Fatalf("ENTER = (fd:%d, handle:%d), want (%d, %d)", gotFD, enter.MMHandle, deviceFD, mmHandle)
+		if gotFD != deviceFD || enter.MMID != mmid {
+			t.Fatalf("ENTER = (fd:%d, mmid:%d), want (%d, %d)", gotFD, enter.MMID, deviceFD, mmid)
 		}
 		for i := 0; i < int(enter.Count); i++ {
 			desc := lane.descriptor(i)
@@ -494,9 +512,9 @@ func TestHemiGvisorAddressSpaceIOIterUsesRingBuffer(t *testing.T) {
 		return 0
 	}
 	s := subprocess{
-		hemiGvisorDevice:   device,
-		hemiGvisorTGID:     1,
-		hemiGvisorMMHandle: mmHandle,
+		hemiGvisorDevice: device,
+		hemiGvisorTGID:   1,
+		hemiGvisorMMID:   mmid,
 	}
 	ars := hostarch.AddrRangeSeqOf(hostarch.AddrRange{Start: base, End: base + hostarch.Addr(length)})
 
@@ -538,9 +556,9 @@ func TestHemiGvisorAddressSpaceIOIterUsesRingBuffer(t *testing.T) {
 func TestHemiGvisorAddressSpaceIOIterUnavailableDoesNotConsumeStream(t *testing.T) {
 	device := &hemiGvisorDeviceState{lanes: make(chan *hemiGvisorRingLane)}
 	s := subprocess{
-		hemiGvisorDevice:   device,
-		hemiGvisorTGID:     1,
-		hemiGvisorMMHandle: 5,
+		hemiGvisorDevice: device,
+		hemiGvisorTGID:   1,
+		hemiGvisorMMID:   5,
 	}
 	ars := hostarch.AddrRangeSeqOf(hostarch.AddrRange{
 		Start: hostarch.Addr(linux.HEMI_GVISOR_VMAR_START),
