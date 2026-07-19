@@ -24,7 +24,6 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
-	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/hostsyscall"
 	"gvisor.dev/gvisor/pkg/log"
@@ -171,13 +170,9 @@ type subprocess struct {
 	// FREE_MM failure retains it so the next acquire rejects this subprocess.
 	hemiGvisorMMID uint64
 	// hemiGvisorPortalMu serializes HEMI address-space lifecycle operations
-	// with user-memory, probe, and atomic portal operations, ensuring that a
+	// with user-memory, probe, and atomic operations, ensuring that a
 	// pooled address space can't be reset while a portal request is in flight.
 	hemiGvisorPortalMu sync.Mutex
-	// hemiGvisorAtomicPortal binds the Host guest and MMID without pinning
-	// adaptor-owned per-mm state; HEMI core validates the MMID on every call.
-	hemiGvisorAtomicPortal              *fd.FD
-	hemiGvisorAtomicPortalBindAttempted bool
 	// hemiGvisorDevice is the device instance controlling the current
 	// AddressSpace lifetime, or a failed FREE_MM retry.
 	hemiGvisorDevice *hemiGvisorDeviceState

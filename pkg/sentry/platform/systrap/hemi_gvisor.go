@@ -349,9 +349,9 @@ func (s *subprocess) hemiGvisorPrepareAddressSpace() error {
 
 	s.hemiGvisorPortalMu.Lock()
 	defer s.hemiGvisorPortalMu.Unlock()
-	if s.hemiGvisorMMID != 0 || s.hemiGvisorAtomicPortal != nil {
-		return fmt.Errorf("HEMI gVisor pooled subprocess still has active state: mmid=%d portal=%v",
-			s.hemiGvisorMMID, s.hemiGvisorAtomicPortal != nil)
+	if s.hemiGvisorMMID != 0 {
+		return fmt.Errorf("HEMI gVisor pooled subprocess still has active MMID %d",
+			s.hemiGvisorMMID)
 	}
 	s.hemiGvisorDevice = device
 	s.hemiGvisorTGID = int32(t.thread.tgid)
@@ -366,14 +366,7 @@ func (s *subprocess) InitializeAddressSpace() error {
 	if s.hemiGvisorDevice == nil {
 		return nil
 	}
-	if err := s.hemiGvisorAllocMMLocked(); err != nil {
-		return err
-	}
-	if err := s.hemiGvisorBindAtomicPortalLocked(); err != nil {
-		_ = s.hemiGvisorFreeMMLocked()
-		return err
-	}
-	return nil
+	return s.hemiGvisorAllocMMLocked()
 }
 
 func (s *subprocess) hemiGvisorReleaseAddressSpace() {
@@ -435,12 +428,6 @@ func (s *subprocess) hemiGvisorAllocMMLocked() error {
 //
 // Preconditions: s.hemiGvisorPortalMu is locked.
 func (s *subprocess) hemiGvisorFreeMMLocked() error {
-	portal := s.hemiGvisorAtomicPortal
-	s.hemiGvisorAtomicPortal = nil
-	s.hemiGvisorAtomicPortalBindAttempted = false
-	if portal != nil {
-		_ = portal.Close()
-	}
 	device := s.hemiGvisorDevice
 	mmid := s.hemiGvisorMMID
 	if mmid == 0 {
@@ -457,41 +444,6 @@ func (s *subprocess) hemiGvisorFreeMMLocked() error {
 		return fmt.Errorf("HEMI gVisor free mm ioctl for MMID %d: %w", mmid, errno)
 	}
 	s.hemiGvisorMMID = 0
-	return nil
-}
-
-// hemiGvisorBindAtomicPortalLocked binds an optional portal fd to the current
-// HEMI guest and MMID. The Host resolves the MMID in HEMI core on every
-// operation, so FREE_MM also revokes an already-open portal. If binding is not
-// available, atomic operations retain the control-device ioctl fallback.
-//
-// Preconditions: s.hemiGvisorPortalMu is locked.
-func (s *subprocess) hemiGvisorBindAtomicPortalLocked() error {
-	if s.hemiGvisorAtomicPortal != nil || s.hemiGvisorAtomicPortalBindAttempted {
-		return nil
-	}
-	device := s.hemiGvisorDevice
-	if device == nil || s.hemiGvisorMMID == 0 {
-		return nil
-	}
-	s.hemiGvisorAtomicPortalBindAttempted = true
-	req := linux.HemiGvisorBindMM{
-		MMID:     s.hemiGvisorMMID,
-		PortalFD: -1,
-	}
-	errno := hostsyscall.RawSyscallErrno6(
-		unix.SYS_IOCTL, uintptr(device.fd), uintptr(linux.HEMI_GVISOR_BIND_MM),
-		uintptr(unsafe.Pointer(&req)), 0, 0, 0)
-	if errno != 0 {
-		return nil
-	}
-	if req.MMID != s.hemiGvisorMMID || req.Flags != 0 || req.PortalFD < 0 {
-		if req.PortalFD >= 0 {
-			_ = unix.Close(int(req.PortalFD))
-		}
-		return fmt.Errorf("HEMI gVisor bind mm ioctl returned an invalid portal: %+v", req)
-	}
-	s.hemiGvisorAtomicPortal = fd.New(int(req.PortalFD))
 	return nil
 }
 
@@ -534,10 +486,6 @@ func (s *subprocess) ForkAddressSpaceFrom(source platform.AddressSpace) error {
 			parent.hemiGvisorMMID, s.hemiGvisorTGID, errno)
 	}
 	s.hemiGvisorMMID = childMMID
-	if err := s.hemiGvisorBindAtomicPortalLocked(); err != nil {
-		_ = s.hemiGvisorFreeMMLocked()
-		return err
-	}
 	return nil
 }
 
@@ -1017,12 +965,8 @@ func (s *subprocess) hemiGvisorAtomicUint32(addr hostarch.Addr, op, old, new uin
 		Old:  old,
 		New:  new,
 	}
-	atomicFD := device.fd
-	if s.hemiGvisorAtomicPortal != nil {
-		atomicFD = int32(s.hemiGvisorAtomicPortal.FD())
-	}
 	errno := hostsyscall.RawSyscallErrno6(
-		unix.SYS_IOCTL, uintptr(atomicFD), uintptr(linux.HEMI_GVISOR_ATOMIC_U32),
+		unix.SYS_IOCTL, uintptr(device.fd), uintptr(linux.HEMI_GVISOR_ATOMIC_U32),
 		uintptr(unsafe.Pointer(&req)), 0, 0, 0)
 	if errno == 0 {
 		return req.Value, nil

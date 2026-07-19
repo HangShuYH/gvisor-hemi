@@ -230,14 +230,6 @@ func TestHemiGvisorRingABILayout(t *testing.T) {
 		t.Fatalf("offsetof(HemiGvisorRingEnter.Reserved) = %d, want %d", got, want)
 	}
 
-	bind := linux.HemiGvisorBindMM{}
-	if got, want := unsafe.Sizeof(bind), uintptr(16); got != want {
-		t.Fatalf("sizeof(HemiGvisorBindMM) = %d, want %d", got, want)
-	}
-	if got, want := unsafe.Offsetof(bind.PortalFD), uintptr(12); got != want {
-		t.Fatalf("offsetof(HemiGvisorBindMM.PortalFD) = %d, want %d", got, want)
-	}
-
 	alloc := linux.HemiGvisorAllocMM{}
 	if got, want := unsafe.Sizeof(alloc), uintptr(24); got != want {
 		t.Fatalf("sizeof(HemiGvisorAllocMM) = %d, want %d", got, want)

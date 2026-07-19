@@ -235,21 +235,9 @@ type HemiGvisorRingEnter struct {
 	Reserved uint64
 }
 
-// HemiGvisorBindMM is struct hemi_gvisor_bind_mm from
-// include/uapi/linux/hemi_gvisor.h.
-//
-// +marshal
-type HemiGvisorBindMM struct {
-	_        structs.HostLayout
-	MMID     uint64
-	Flags    uint32
-	PortalFD int32
-}
-
 var (
 	HEMI_GVISOR_SETUP_RING = IOWR(HEMI_GVISOR_IOCTL_TYPE, 0x15, uint32((*HemiGvisorRingSetup)(nil).SizeBytes()))
 	HEMI_GVISOR_ENTER_RING = IOW(HEMI_GVISOR_IOCTL_TYPE, 0x16, uint32((*HemiGvisorRingEnter)(nil).SizeBytes()))
-	HEMI_GVISOR_BIND_MM    = IOWR(HEMI_GVISOR_IOCTL_TYPE, 0x17, uint32((*HemiGvisorBindMM)(nil).SizeBytes()))
 )
 
 const (
