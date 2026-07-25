@@ -195,10 +195,6 @@ restart:
 	}
 
 	if isSyscall {
-		// HEMI file mmap is mirrored by the stub after sentry resolves the
-		// guest fd to a host backing fd. The mmap itself still enters the
-		// generic sentry syscall implementation.
-		s.prepareHemiGvisorMapFile(ctx, c, ac)
 		return nil, hostarch.NoAccess, nil
 	}
 

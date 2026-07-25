@@ -17,6 +17,7 @@ package mm
 import (
 	"testing"
 
+	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
@@ -24,6 +25,14 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel/futex"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 )
+
+type reservationTestMappable struct {
+	memmap.MappableNoTrackMappings
+}
+
+func (*reservationTestMappable) Translate(context.Context, memmap.MappableRange, memmap.MappableRange, hostarch.AccessType) ([]memmap.Translation, error) {
+	return nil, linuxerr.EFAULT
+}
 
 func TestFindAvailableAvoidsReservedRange(t *testing.T) {
 	const page = uint64(hostarch.PageSize)
@@ -102,6 +111,31 @@ func TestForceMMapCannotUseReservedRange(t *testing.T) {
 	})
 	if !linuxerr.Equals(linuxerr.ENOMEM, err) {
 		t.Fatalf("MMap() error = %v, want %v", err, linuxerr.ENOMEM)
+	}
+}
+
+func TestFixedPrivateFileMMapMayUsePlatformReservedRange(t *testing.T) {
+	ctx := contexttest.Context(t)
+	mm := testMemoryManager(ctx, t)
+	defer mm.DecUsers(ctx)
+
+	mm.reservedAR = hostarch.AddrRange{Start: 0x50000000, End: 0x50001000}
+	got, err := mm.MMap(ctx, memmap.MMapOpts{
+		Addr:                  mm.reservedAR.Start,
+		Length:                hostarch.PageSize,
+		Fixed:                 true,
+		Unmap:                 true,
+		Private:               true,
+		Mappable:              &reservationTestMappable{},
+		Perms:                 hostarch.Read,
+		MaxPerms:              hostarch.AnyAccess,
+		AllowPlatformReserved: true,
+	})
+	if err != nil {
+		t.Fatalf("MMap() unexpected error: %v", err)
+	}
+	if got != mm.reservedAR.Start {
+		t.Fatalf("MMap() = %#x, want %#x", got, mm.reservedAR.Start)
 	}
 }
 

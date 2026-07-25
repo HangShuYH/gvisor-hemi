@@ -113,6 +113,10 @@ func (mm *MemoryManager) MMap(ctx context.Context, opts memmap.MMapOpts) (hostar
 	if opts.GrowsDown && opts.Mappable != nil {
 		return 0, linuxerr.EINVAL
 	}
+	if opts.AllowPlatformReserved &&
+		(!opts.Fixed || !opts.Private || opts.Mappable == nil) {
+		return 0, linuxerr.EINVAL
+	}
 
 	// Get the new vma.
 	mm.mappingMu.Lock()

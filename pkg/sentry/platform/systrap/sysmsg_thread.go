@@ -156,15 +156,6 @@ func sysmsgThreadRules(stubStart uintptr) []bpf.Instruction {
 					seccomp.AnyValue{},
 					seccomp.GreaterThan(stubStart), // rip
 				},
-				unix.SYS_IOCTL: seccomp.PerArg{
-					seccomp.NonNegativeFD{},
-					seccomp.EqualTo(linux.HEMI_GVISOR_MAP_FILE),
-					seccomp.AnyValue{},
-					seccomp.AnyValue{},
-					seccomp.AnyValue{},
-					seccomp.AnyValue{},
-					seccomp.GreaterThan(stubStart), // rip
-				},
 				unix.SYS_SCHED_YIELD: seccomp.PerArg{
 					seccomp.AnyValue{},
 					seccomp.AnyValue{},

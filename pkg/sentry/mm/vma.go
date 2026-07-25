@@ -45,13 +45,14 @@ func (mm *MemoryManager) createVMALocked(ctx context.Context, opts memmap.MMapOp
 
 	// Find a usable range.
 	addr, err := mm.findAvailableLocked(opts.Length, findAvailableOpts{
-		Addr:      opts.Addr,
-		Fixed:     opts.Fixed,
-		GrowsDown: opts.GrowsDown,
-		Stack:     opts.Stack,
-		Private:   opts.Private,
-		Unmap:     opts.Unmap,
-		Map32Bit:  opts.Map32Bit,
+		Addr:                  opts.Addr,
+		Fixed:                 opts.Fixed,
+		GrowsDown:             opts.GrowsDown,
+		Stack:                 opts.Stack,
+		Private:               opts.Private,
+		Unmap:                 opts.Unmap,
+		Map32Bit:              opts.Map32Bit,
+		AllowPlatformReserved: opts.AllowPlatformReserved,
 	})
 	if err != nil {
 		// Can't force without opts.Unmap and opts.Fixed.
@@ -62,7 +63,7 @@ func (mm *MemoryManager) createVMALocked(ctx context.Context, opts memmap.MMapOp
 		}
 	}
 	ar, _ := addr.ToRange(opts.Length)
-	if ar.Overlaps(mm.reservedAR) {
+	if ar.Overlaps(mm.reservedAR) && !opts.AllowPlatformReserved {
 		return vmaIterator{}, hostarch.AddrRange{}, droppedIDs, linuxerr.ENOMEM
 	}
 
@@ -153,13 +154,14 @@ type findAvailableOpts struct {
 	//
 	//	- Unmap allows existing guard pages in the returned range.
 
-	Addr      hostarch.Addr
-	Fixed     bool
-	GrowsDown bool
-	Stack     bool
-	Private   bool
-	Unmap     bool
-	Map32Bit  bool
+	Addr                  hostarch.Addr
+	Fixed                 bool
+	GrowsDown             bool
+	Stack                 bool
+	Private               bool
+	Unmap                 bool
+	Map32Bit              bool
+	AllowPlatformReserved bool
 }
 
 func addressSpaceReservedRange(as platform.AddressSpace) hostarch.AddrRange {
@@ -197,6 +199,9 @@ func (mm *MemoryManager) findAvailableLocked(length uint64, opts findAvailableOp
 		allowedAR = allowedAR.Intersect(hostarch.AddrRange{map32Start, map32End})
 	}
 	reservedAR := mm.reservedAR.Intersect(allowedAR)
+	if opts.AllowPlatformReserved {
+		reservedAR = hostarch.AddrRange{}
+	}
 
 	// Does the provided suggestion work?
 	if ar, ok := opts.Addr.ToRange(length); ok {

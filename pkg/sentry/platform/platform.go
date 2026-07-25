@@ -410,6 +410,14 @@ type AddressSpaceInitializer interface {
 	InitializeAddressSpace() error
 }
 
+// AddressSpacePrivateFileMapper is implemented by AddressSpaces that can
+// publish an already-created private file VMA to a host-managed address space.
+// The Guest VMA remains authoritative unless the implementation accepts the
+// exact address returned by MemoryManager.MMap.
+type AddressSpacePrivateFileMapper interface {
+	PublishPrivateFileMapping(ctx context.Context, addr hostarch.Addr, length, prot, flags uint64, guestFD int32, offset uint64, mappable memmap.Mappable, identity memmap.MappingIdentity) error
+}
+
 // AddressSpaceIO supports IO through the memory mappings installed in an
 // AddressSpace.
 //

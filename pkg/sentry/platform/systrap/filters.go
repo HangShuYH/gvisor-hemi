@@ -104,11 +104,6 @@ func (systrapSeccomp) SyscallFilters(vars precompiledseccomp.Values) seccomp.Sys
 		unix.SYS_IOCTL: seccomp.Or{
 			seccomp.PerArg{
 				seccomp.NonNegativeFD{},
-				seccomp.EqualTo(linux.HEMI_GVISOR_MAP_FILE),
-				seccomp.AnyValue{},
-			},
-			seccomp.PerArg{
-				seccomp.NonNegativeFD{},
 				seccomp.EqualTo(linux.SECCOMP_IOCTL_NOTIF_RECV),
 			},
 			seccomp.PerArg{

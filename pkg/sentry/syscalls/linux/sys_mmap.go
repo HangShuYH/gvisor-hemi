@@ -25,6 +25,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
+	"gvisor.dev/gvisor/pkg/sentry/platform"
 )
 
 // Brk implements linux syscall brk(2).
@@ -122,6 +123,10 @@ func Mmap(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *
 		if err := file.ConfigureMMap(t, &opts); err != nil {
 			return 0, nil, err
 		}
+		if fixed && private {
+			_, opts.AllowPlatformReserved =
+				t.MemoryManager().AddressSpace().(platform.AddressSpacePrivateFileMapper)
+		}
 	} else if shared {
 		// Back shared anonymous mappings with an anonymous tmpfs file.
 		opts.Offset = 0
@@ -138,6 +143,18 @@ func Mmap(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *
 	}
 
 	rv, err := t.MemoryManager().MMap(t, opts)
+	if err == nil && !anon && private && opts.Mappable != nil && opts.MappingIdentity != nil {
+		if mapper, ok := t.MemoryManager().AddressSpace().(platform.AddressSpacePrivateFileMapper); ok {
+			// Publishing is an optional optimization. The Guest VMA has
+			// already succeeded and remains the fallback if Host HEMI cannot
+			// accept the same mapping.
+			if err := mapper.PublishPrivateFileMapping(
+				t, rv, opts.Length, uint64(prot), uint64(flags), fd,
+				opts.Offset, opts.Mappable, opts.MappingIdentity); err != nil {
+				t.Debugf("HEMI private file mapping was not published: %v", err)
+			}
+		}
+	}
 	return uintptr(rv), nil, err
 }
 

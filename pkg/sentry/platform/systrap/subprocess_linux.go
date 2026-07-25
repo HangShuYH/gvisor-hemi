@@ -96,12 +96,6 @@ func attachedThread(flags uintptr, defaultAction seccomp.Action) (*thread, error
 				// Injected to support the address space operations.
 				unix.SYS_MMAP:   seccomp.MatchAll{},
 				unix.SYS_MUNMAP: seccomp.MatchAll{},
-				unix.SYS_IOCTL: seccomp.PerArg{
-					seccomp.NonNegativeFD{},
-					seccomp.EqualTo(linux.HEMI_GVISOR_MAP_FILE),
-					seccomp.AnyValue{},
-				},
-
 				// For sysmsg threads. Look at sysmsg/sighandler.c for more details.
 				unix.SYS_RT_SIGRETURN: seccomp.MatchAll{},
 				unix.SYS_SCHED_YIELD:  seccomp.MatchAll{},

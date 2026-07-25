@@ -116,47 +116,57 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 	unix.SYS_IOCTL: seccomp.Or{
 		seccomp.PerArg{
 			seccomp.NonNegativeFD{},
-			seccomp.EqualTo(linux.HEMI_GVISOR_ALLOC_MM),
+			seccomp.EqualTo(linux.HEMI_USERSPACE_INIT_SESSION),
 			seccomp.AnyValue{},
 		},
 		seccomp.PerArg{
 			seccomp.NonNegativeFD{},
-			seccomp.EqualTo(linux.HEMI_GVISOR_FORK_MM),
+			seccomp.EqualTo(linux.HEMI_USERSPACE_ALLOC_MM),
 			seccomp.AnyValue{},
 		},
 		seccomp.PerArg{
 			seccomp.NonNegativeFD{},
-			seccomp.EqualTo(linux.HEMI_GVISOR_FREE_MM),
+			seccomp.EqualTo(linux.HEMI_USERSPACE_FORK_MM),
 			seccomp.AnyValue{},
 		},
 		seccomp.PerArg{
 			seccomp.NonNegativeFD{},
-			seccomp.EqualTo(linux.HEMI_GVISOR_READ_USER),
+			seccomp.EqualTo(linux.HEMI_USERSPACE_FREE_MM),
 			seccomp.AnyValue{},
 		},
 		seccomp.PerArg{
 			seccomp.NonNegativeFD{},
-			seccomp.EqualTo(linux.HEMI_GVISOR_WRITE_USER),
+			seccomp.EqualTo(linux.HEMI_USERSPACE_ACCESS),
 			seccomp.AnyValue{},
 		},
 		seccomp.PerArg{
 			seccomp.NonNegativeFD{},
-			seccomp.EqualTo(linux.HEMI_GVISOR_ATOMIC_U32),
+			seccomp.EqualTo(linux.HEMI_USERSPACE_ATOMIC_U32),
 			seccomp.AnyValue{},
 		},
 		seccomp.PerArg{
 			seccomp.NonNegativeFD{},
-			seccomp.EqualTo(linux.HEMI_GVISOR_PROBE_USER),
+			seccomp.EqualTo(linux.HEMI_USERSPACE_PROBE_USER),
 			seccomp.AnyValue{},
 		},
 		seccomp.PerArg{
 			seccomp.NonNegativeFD{},
-			seccomp.EqualTo(linux.HEMI_GVISOR_SETUP_RING),
+			seccomp.EqualTo(linux.HEMI_USERSPACE_SETUP_RING),
 			seccomp.AnyValue{},
 		},
 		seccomp.PerArg{
 			seccomp.NonNegativeFD{},
-			seccomp.EqualTo(linux.HEMI_GVISOR_ENTER_RING),
+			seccomp.EqualTo(linux.HEMI_USERSPACE_ENTER_RING),
+			seccomp.AnyValue{},
+		},
+		seccomp.PerArg{
+			seccomp.NonNegativeFD{},
+			seccomp.EqualTo(linux.HEMI_USERSPACE_MAP_FILE),
+			seccomp.AnyValue{},
+		},
+		seccomp.PerArg{
+			seccomp.NonNegativeFD{},
+			seccomp.EqualTo(linux.HEMI_USERSPACE_DRAIN_RELEASES),
 			seccomp.AnyValue{},
 		},
 		// These commands are needed for host FD.
