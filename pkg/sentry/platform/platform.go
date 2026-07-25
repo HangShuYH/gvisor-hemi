@@ -418,6 +418,25 @@ type AddressSpacePrivateFileMapper interface {
 	PublishPrivateFileMapping(ctx context.Context, addr hostarch.Addr, length, prot, flags uint64, guestFD int32, offset uint64, mappable memmap.Mappable, identity memmap.MappingIdentity) error
 }
 
+// AddressSpaceFilePager is implemented by AddressSpaces that delegate
+// file-backed page faults to the Sentry. MemoryManager calls ResolveFileFault
+// while holding its mapping lock for reading, which synchronizes Translate
+// with mapping invalidation.
+type AddressSpaceFilePager interface {
+	// ResolveFileFault resolves a Host-requested file fault at addr. mappable
+	// and faultMR identify the faulting page; optionalMR is the contiguous
+	// range in the same VMA that may be resolved speculatively. It returns
+	// false when the fault must follow the normal MemoryManager path.
+	//
+	// Preconditions:
+	//   - faultMR and optionalMR are page-aligned.
+	//   - faultMR.Length() == hostarch.PageSize.
+	//   - optionalMR.IsSupersetOf(faultMR).
+	//   - the caller synchronizes mappable.Translate with invalidation.
+	ResolveFileFault(ctx context.Context, addr hostarch.Addr, at hostarch.AccessType,
+		mappable memmap.Mappable, faultMR, optionalMR memmap.MappableRange) (bool, error)
+}
+
 // AddressSpaceIO supports IO through the memory mappings installed in an
 // AddressSpace.
 //
@@ -500,10 +519,17 @@ type AddressSpaceIOBatchSizer interface {
 	AddressSpaceIOBatchSize() int
 }
 
+// AddressSpaceIOFaultHandler resolves a target-memory fault so that a
+// streaming AddressSpaceIO implementation can retry data already buffered
+// from its Reader.
+type AddressSpaceIOFaultHandler func(addr hostarch.Addr, at hostarch.AccessType) error
+
 // AddressSpaceIOIter is implemented by AddressSpaces that can stream data
 // directly between a safemem Reader or Writer and a platform-owned reusable
 // buffer. It avoids an intermediate MemoryManager buffer when the platform
-// already has a bounce buffer, such as a shared descriptor ring.
+// already has a bounce buffer, such as a shared descriptor ring. If target
+// access requires a file page, implementations must call handleFault and retry
+// without consuming the Reader again.
 //
 // MemoryManager invokes these methods only when AddressSpaceIO is applicable
 // to every non-empty range in ars. Implementations may call src or dst
@@ -515,8 +541,8 @@ type AddressSpaceIOBatchSizer interface {
 // accessing ars must be wrapped in AddressSpaceIOStreamError; errors returned
 // by src or dst must be returned unchanged.
 type AddressSpaceIOIter interface {
-	CopyOutFromIter(ars hostarch.AddrRangeSeq, src safemem.Reader) (int64, error)
-	CopyInToIter(ars hostarch.AddrRangeSeq, dst safemem.Writer) (int64, error)
+	CopyOutFromIter(ars hostarch.AddrRangeSeq, src safemem.Reader, handleFault AddressSpaceIOFaultHandler) (int64, error)
+	CopyInToIter(ars hostarch.AddrRangeSeq, dst safemem.Writer, handleFault AddressSpaceIOFaultHandler) (int64, error)
 }
 
 // AddressSpaceIOStreamError wraps an error caused by accessing the target
@@ -595,6 +621,18 @@ type SegmentationFault struct {
 // Error implements error.Error.
 func (f SegmentationFault) Error() string {
 	return fmt.Sprintf("segmentation fault at %#x", f.Addr)
+}
+
+// AddressSpaceFileFault reports that AddressSpaceIO reached a file-backed page
+// that must be supplied through AddressSpaceFilePager before the operation can
+// retry.
+type AddressSpaceFileFault struct {
+	Addr hostarch.Addr
+}
+
+// Error implements error.Error.
+func (f AddressSpaceFileFault) Error() string {
+	return fmt.Sprintf("file-backed page fault at %#x", f.Addr)
 }
 
 // AddressSpaceIOUnavailable is an error returned by AddressSpaceIO methods

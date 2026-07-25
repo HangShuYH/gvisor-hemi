@@ -66,6 +66,40 @@ func (*hemiGvisorTestIdentity) Msync(context.Context, memmap.MappableRange) erro
 	return nil
 }
 
+type hemiGvisorTestFile struct {
+	memmap.DefaultMemoryType
+	refs int
+	data [hostarch.PageSize]byte
+}
+
+func (f *hemiGvisorTestFile) IncRef(memmap.FileRange, uint32) {
+	f.refs++
+}
+
+func (f *hemiGvisorTestFile) DecRef(memmap.FileRange) {
+	f.refs--
+}
+
+func (*hemiGvisorTestFile) MapInternal(memmap.FileRange, hostarch.AccessType) (safemem.BlockSeq, error) {
+	return safemem.BlockSeq{}, memmap.BufferedIOFallbackErr{}
+}
+
+func (f *hemiGvisorTestFile) BufferReadAt(off uint64, dst []byte) (uint64, error) {
+	return uint64(copy(dst, f.data[off:])), nil
+}
+
+func (*hemiGvisorTestFile) BufferWriteAt(uint64, []byte) (uint64, error) {
+	return 0, errors.New("unused")
+}
+
+func (*hemiGvisorTestFile) DataFD(memmap.FileRange) (int, error) {
+	return -1, errors.New("unused")
+}
+
+func (*hemiGvisorTestFile) FD() int {
+	return -1
+}
+
 func TestHemiGvisorAllocateMMID(t *testing.T) {
 	device := &hemiGvisorDeviceState{}
 	for _, want := range []uint64{1, 2} {
@@ -120,6 +154,38 @@ func TestHemiGvisorFileTokenOwnership(t *testing.T) {
 	}
 	if err := device.releaseToken(ctx, fileToken, linux.HEMI_USERSPACE_RELEASE_FILE, 1); err == nil {
 		t.Fatal("duplicate file release unexpectedly succeeded")
+	}
+}
+
+func TestHemiGvisorPageTokenOwnership(t *testing.T) {
+	ctx := context.Background()
+	file := &hemiGvisorTestFile{}
+	for i := range file.data {
+		file.data[i] = byte(i)
+	}
+	device := &hemiGvisorDeviceState{tokens: make(map[uint64]hemiGvisorToken)}
+	translation := memmap.Translation{
+		Source: memmap.MappableRange{Start: 0, End: hostarch.PageSize},
+		File:   file,
+		Offset: 0,
+		Perms:  hostarch.Read,
+	}
+
+	page, err := device.prepareFilePage(ctx, translation, 0)
+	if err != nil {
+		t.Fatalf("prepareFilePage: %v", err)
+	}
+	if page.PageToken == 0 || page.PageVA%uint64(hostarch.PageSize) != 0 {
+		t.Fatalf("prepareFilePage returned invalid token/VA: %+v", page)
+	}
+	if file.refs != 1 || len(device.tokens) != 1 {
+		t.Fatalf("page ownership after prepare = (refs:%d, tokens:%d), want (1, 1)", file.refs, len(device.tokens))
+	}
+	if err := device.releaseToken(ctx, page.PageToken, linux.HEMI_USERSPACE_RELEASE_PAGE, 1); err != nil {
+		t.Fatalf("release page token: %v", err)
+	}
+	if file.refs != 0 || len(device.tokens) != 0 {
+		t.Fatalf("page ownership after release = (refs:%d, tokens:%d), want (0, 0)", file.refs, len(device.tokens))
 	}
 }
 
@@ -552,7 +618,7 @@ func TestHemiGvisorAddressSpaceIOIterUsesRingBuffer(t *testing.T) {
 		}
 		return readerState.ReadToBlocks(dsts)
 	})
-	if n, err := s.copyOutFromIter(ars, reader, enterFn); n != int64(length) || err != nil {
+	if n, err := s.copyOutFromIter(ars, reader, nil, enterFn); n != int64(length) || err != nil {
 		t.Fatalf("CopyOutFromIter = (%d, %v), want (%d, nil)", n, err, length)
 	}
 	if readerCalls != 2 || !bytes.Equal(ringWrite, source) {
@@ -569,7 +635,7 @@ func TestHemiGvisorAddressSpaceIOIterUsesRingBuffer(t *testing.T) {
 		}
 		return safemem.FromIOWriter{Writer: &got}.WriteFromBlocks(srcs)
 	})
-	if n, err := s.copyInToIter(ars, writer, enterFn); n != int64(length) || err != nil {
+	if n, err := s.copyInToIter(ars, writer, nil, enterFn); n != int64(length) || err != nil {
 		t.Fatalf("CopyInToIter = (%d, %v), want (%d, nil)", n, err, length)
 	}
 	if writerCalls != 2 || !bytes.Equal(got.Bytes(), source) {
@@ -592,8 +658,115 @@ func TestHemiGvisorAddressSpaceIOIterUnavailableDoesNotConsumeStream(t *testing.
 	_, err := s.CopyOutFromIter(ars, safemem.ReaderFunc(func(dsts safemem.BlockSeq) (uint64, error) {
 		readerCalls++
 		return 0, nil
-	}))
+	}), nil)
 	if _, ok := err.(platform.AddressSpaceIOUnavailable); !ok || readerCalls != 0 {
 		t.Fatalf("unavailable stream = (%T(%v), Reader calls:%d), want (AddressSpaceIOUnavailable, 0)", err, err, readerCalls)
+	}
+}
+
+func TestHemiGvisorAddressSpaceIOIterRetriesFileFaultWithoutRereading(t *testing.T) {
+	lane := newTestHemiGvisorRingLane()
+	lanes := make(chan *hemiGvisorRingLane, 1)
+	lanes <- lane
+	const (
+		deviceFD = int32(3)
+		mmid     = uint64(5)
+		base     = hostarch.Addr(linux.HEMI_USERSPACE_VMAR_START)
+	)
+	device := &hemiGvisorDeviceState{fd: deviceFD, lanes: lanes}
+	s := subprocess{
+		hemiGvisorDevice: device,
+		hemiGvisorTGID:   1,
+		hemiGvisorMMID:   mmid,
+	}
+	source := bytes.Repeat([]byte{0x5a}, hostarch.PageSize)
+	ars := hostarch.AddrRangeSeqOf(hostarch.AddrRange{Start: base, End: base + hostarch.Addr(len(source))})
+
+	readerCalls := 0
+	reader := safemem.ReaderFunc(func(dsts safemem.BlockSeq) (uint64, error) {
+		readerCalls++
+		return safemem.CopySeq(dsts, safemem.BlockSeqOf(safemem.BlockFromSafeSlice(source)))
+	})
+	enterCalls := 0
+	enterFn := func(int32, *linux.HemiUserspaceRingEnter) unix.Errno {
+		enterCalls++
+		desc := lane.descriptor(0)
+		if enterCalls == 1 {
+			desc.Result = -int32(unix.EAGAIN)
+			return 0
+		}
+		if got := lane.data(0, int(desc.Len)); !bytes.Equal(got, source) {
+			t.Fatal("ring retry did not retain the Reader's data")
+		}
+		desc.Done = desc.Len
+		desc.Result = 0
+		return 0
+	}
+	faultCalls := 0
+	handleFault := func(addr hostarch.Addr, at hostarch.AccessType) error {
+		faultCalls++
+		if addr != base || at != hostarch.Write {
+			t.Fatalf("fault handler = (%#x, %v), want (%#x, %v)", addr, at, base, hostarch.Write)
+		}
+		return nil
+	}
+
+	if n, err := s.copyOutFromIter(ars, reader, handleFault, enterFn); n != int64(len(source)) || err != nil {
+		t.Fatalf("CopyOutFromIter = (%d, %v), want (%d, nil)", n, err, len(source))
+	}
+	if readerCalls != 1 || enterCalls != 2 || faultCalls != 1 {
+		t.Fatalf("retry calls = (reader:%d, enter:%d, fault:%d), want (1, 2, 1)", readerCalls, enterCalls, faultCalls)
+	}
+}
+
+func TestHemiGvisorAddressSpaceIOIterRetriesInitialReadFileFault(t *testing.T) {
+	lane := newTestHemiGvisorRingLane()
+	lanes := make(chan *hemiGvisorRingLane, 1)
+	lanes <- lane
+	const (
+		deviceFD = int32(3)
+		mmid     = uint64(5)
+		base     = hostarch.Addr(linux.HEMI_USERSPACE_VMAR_START)
+	)
+	device := &hemiGvisorDeviceState{fd: deviceFD, lanes: lanes}
+	s := subprocess{
+		hemiGvisorDevice: device,
+		hemiGvisorTGID:   1,
+		hemiGvisorMMID:   mmid,
+	}
+	source := bytes.Repeat([]byte{0x5a}, hostarch.PageSize)
+	copy(lane.data(0, len(source)), source)
+	ars := hostarch.AddrRangeSeqOf(hostarch.AddrRange{Start: base, End: base + hostarch.Addr(len(source))})
+
+	enterCalls := 0
+	enterFn := func(int32, *linux.HemiUserspaceRingEnter) unix.Errno {
+		enterCalls++
+		desc := lane.descriptor(0)
+		if enterCalls == 1 {
+			desc.Result = -int32(unix.EAGAIN)
+			return 0
+		}
+		desc.Done = desc.Len
+		desc.Result = 0
+		return 0
+	}
+	faultCalls := 0
+	handleFault := func(addr hostarch.Addr, at hostarch.AccessType) error {
+		faultCalls++
+		if addr != base || at != hostarch.Read {
+			t.Fatalf("fault handler = (%#x, %v), want (%#x, %v)", addr, at, base, hostarch.Read)
+		}
+		return nil
+	}
+	var got bytes.Buffer
+
+	if n, err := s.copyInToIter(
+		ars, safemem.FromIOWriter{Writer: &got}, handleFault, enterFn,
+	); n != int64(len(source)) || err != nil {
+		t.Fatalf("CopyInToIter = (%d, %v), want (%d, nil)", n, err, len(source))
+	}
+	if enterCalls != 2 || faultCalls != 1 || !bytes.Equal(got.Bytes(), source) {
+		t.Fatalf("retry result = (enter:%d, fault:%d, data:%t), want (2, 1, true)",
+			enterCalls, faultCalls, bytes.Equal(got.Bytes(), source))
 	}
 }

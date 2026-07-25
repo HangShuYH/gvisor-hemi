@@ -59,7 +59,7 @@ func (as *directIterTestAddressSpace) CopyIn(addr hostarch.Addr, dst []byte) (in
 	return len(dst), nil
 }
 
-func (as *directIterTestAddressSpace) CopyOutFromIter(ars hostarch.AddrRangeSeq, src safemem.Reader) (int64, error) {
+func (as *directIterTestAddressSpace) CopyOutFromIter(ars hostarch.AddrRangeSeq, src safemem.Reader, _ platform.AddressSpaceIOFaultHandler) (int64, error) {
 	as.streamCopyOutCalls++
 	if as.streamUnavailable {
 		return 0, platform.AddressSpaceIOUnavailable{}
@@ -73,7 +73,7 @@ func (as *directIterTestAddressSpace) CopyOutFromIter(ars hostarch.AddrRangeSeq,
 	return int64(n), err
 }
 
-func (as *directIterTestAddressSpace) CopyInToIter(ars hostarch.AddrRangeSeq, dst safemem.Writer) (int64, error) {
+func (as *directIterTestAddressSpace) CopyInToIter(ars hostarch.AddrRangeSeq, dst safemem.Writer, _ platform.AddressSpaceIOFaultHandler) (int64, error) {
 	as.streamCopyInCalls++
 	if as.streamUnavailable {
 		return 0, platform.AddressSpaceIOUnavailable{}

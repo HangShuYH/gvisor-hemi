@@ -166,6 +166,11 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 		},
 		seccomp.PerArg{
 			seccomp.NonNegativeFD{},
+			seccomp.EqualTo(linux.HEMI_USERSPACE_FILE_FAULT),
+			seccomp.AnyValue{},
+		},
+		seccomp.PerArg{
+			seccomp.NonNegativeFD{},
 			seccomp.EqualTo(linux.HEMI_USERSPACE_DRAIN_RELEASES),
 			seccomp.AnyValue{},
 		},

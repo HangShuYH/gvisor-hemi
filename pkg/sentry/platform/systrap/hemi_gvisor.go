@@ -17,8 +17,10 @@ package systrap
 import (
 	"errors"
 	"fmt"
+	"io"
 	"runtime"
 	"sync"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -31,6 +33,7 @@ import (
 	"gvisor.dev/gvisor/pkg/memutil"
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 )
 
@@ -59,6 +62,7 @@ var hemiGvisorZeroBuffer [hemiGvisorRingBatchBytes]byte
 var (
 	_ platform.AddressSpaceInitializer       = (*subprocess)(nil)
 	_ platform.AddressSpaceForker            = (*subprocess)(nil)
+	_ platform.AddressSpaceFilePager         = (*subprocess)(nil)
 	_ platform.AddressSpaceIOIter            = (*subprocess)(nil)
 	_ platform.AddressSpacePrivateFileMapper = (*subprocess)(nil)
 )
@@ -99,10 +103,14 @@ type hemiGvisorDeviceState struct {
 }
 
 type hemiGvisorToken struct {
-	kind     uint32
-	mappable memmap.Mappable
-	identity memmap.MappingIdentity
-	refs     uint64
+	kind      uint32
+	mappable  memmap.Mappable
+	identity  memmap.MappingIdentity
+	file      memmap.File
+	fileRange memmap.FileRange
+	block     safemem.Block
+	mapping   []byte
+	refs      uint64
 }
 
 func (d *hemiGvisorDeviceState) allocateMMID() (uint64, error) {
@@ -159,9 +167,19 @@ func hemiGvisorSetDeviceFD(deviceFile *fd.FD) {
 	state.lanes = hemiGvisorSetupRingLanes(state.fd)
 
 	hemiGvisorDevice.Lock()
-	defer hemiGvisorDevice.Unlock()
-
 	hemiGvisorDevice.state = state
+	hemiGvisorDevice.Unlock()
+	go state.drainReleaseLoop()
+}
+
+func (d *hemiGvisorDeviceState) drainReleaseLoop() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		if err := d.drainReleases(context.Background()); err != nil {
+			log.Warningf("HEMI gVisor periodic release drain failed: %v", err)
+		}
+	}
 }
 
 func hemiGvisorCurrentDevice() *hemiGvisorDeviceState {
@@ -587,6 +605,9 @@ func hemiGvisorUserMemResult(addr hostarch.Addr, length int, doneBytes uint64, r
 	if resultErrno == unix.EFAULT {
 		return done, platform.SegmentationFault{Addr: addr + hostarch.Addr(done)}
 	}
+	if resultErrno == unix.EAGAIN {
+		return done, platform.AddressSpaceFileFault{Addr: addr + hostarch.Addr(done)}
+	}
 	return done, fmt.Errorf("HEMI gVisor user memory access: %w", resultErrno)
 }
 
@@ -678,14 +699,22 @@ func (s *subprocess) hemiGvisorTransferRingInPlace(device *hemiGvisorDeviceState
 	return n, nil
 }
 
+func hemiGvisorFileFaultAddr(err error) (hostarch.Addr, bool) {
+	if streamErr, ok := err.(*platform.AddressSpaceIOStreamError); ok {
+		err = streamErr.Err
+	}
+	fault, ok := err.(platform.AddressSpaceFileFault)
+	return fault.Addr, ok
+}
+
 // CopyOutFromIter implements platform.AddressSpaceIOIter.CopyOutFromIter. The
 // Reader fills the ring lane directly; ENTER_RING then copies from that same
 // shared buffer into HEMI-managed application memory.
-func (s *subprocess) CopyOutFromIter(ars hostarch.AddrRangeSeq, src safemem.Reader) (int64, error) {
-	return s.copyOutFromIter(ars, src, hemiGvisorRawRingEnter)
+func (s *subprocess) CopyOutFromIter(ars hostarch.AddrRangeSeq, src safemem.Reader, handleFault platform.AddressSpaceIOFaultHandler) (int64, error) {
+	return s.copyOutFromIter(ars, src, handleFault, hemiGvisorRawRingEnter)
 }
 
-func (s *subprocess) copyOutFromIter(ars hostarch.AddrRangeSeq, src safemem.Reader, enterFn hemiGvisorRingEnterFunc) (int64, error) {
+func (s *subprocess) copyOutFromIter(ars hostarch.AddrRangeSeq, src safemem.Reader, handleFault platform.AddressSpaceIOFaultHandler, enterFn hemiGvisorRingEnterFunc) (int64, error) {
 	device, lane, mmid, err := s.hemiGvisorAcquireRingLane(ars)
 	if err != nil {
 		return 0, err
@@ -707,15 +736,24 @@ func (s *subprocess) copyOutFromIter(ars hostarch.AddrRangeSeq, src safemem.Read
 		}
 		n := int(n64)
 		if n != 0 {
-			copied, targetErr := s.hemiGvisorTransferRingInPlace(
-				device, lane, mmid, ar.Start, buf[:n], linux.HEMI_USERSPACE_RING_OP_WRITE, enterFn)
-			done += int64(copied)
-			ars = ars.DropFirst(copied)
-			if targetErr != nil {
+			var copied int
+			for copied < n {
+				progress, targetErr := s.hemiGvisorTransferRingInPlace(
+					device, lane, mmid, ar.Start+hostarch.Addr(copied), buf[copied:n],
+					linux.HEMI_USERSPACE_RING_OP_WRITE, enterFn)
+				copied += progress
+				done += int64(progress)
+				ars = ars.DropFirst(progress)
+				if targetErr == nil {
+					continue
+				}
+				if faultAddr, ok := hemiGvisorFileFaultAddr(targetErr); ok && handleFault != nil {
+					if err := handleFault(faultAddr, hostarch.Write); err != nil {
+						return done, err
+					}
+					continue
+				}
 				return done, targetErr
-			}
-			if copied != n {
-				return done, &platform.AddressSpaceIOStreamError{Err: fmt.Errorf("HEMI gVisor ring copied only %d/%d bytes without an error", copied, n)}
 			}
 		}
 		if srcErr != nil {
@@ -731,11 +769,11 @@ func (s *subprocess) copyOutFromIter(ars hostarch.AddrRangeSeq, src safemem.Read
 // CopyInToIter implements platform.AddressSpaceIOIter.CopyInToIter. The ring
 // lane receives HEMI-managed application memory and is passed directly to the
 // Writer without an intermediate MemoryManager buffer.
-func (s *subprocess) CopyInToIter(ars hostarch.AddrRangeSeq, dst safemem.Writer) (int64, error) {
-	return s.copyInToIter(ars, dst, hemiGvisorRawRingEnter)
+func (s *subprocess) CopyInToIter(ars hostarch.AddrRangeSeq, dst safemem.Writer, handleFault platform.AddressSpaceIOFaultHandler) (int64, error) {
+	return s.copyInToIter(ars, dst, handleFault, hemiGvisorRawRingEnter)
 }
 
-func (s *subprocess) copyInToIter(ars hostarch.AddrRangeSeq, dst safemem.Writer, enterFn hemiGvisorRingEnterFunc) (int64, error) {
+func (s *subprocess) copyInToIter(ars hostarch.AddrRangeSeq, dst safemem.Writer, handleFault platform.AddressSpaceIOFaultHandler, enterFn hemiGvisorRingEnterFunc) (int64, error) {
 	device, lane, mmid, err := s.hemiGvisorAcquireRingLane(ars)
 	if err != nil {
 		return 0, err
@@ -754,6 +792,12 @@ func (s *subprocess) copyInToIter(ars hostarch.AddrRangeSeq, dst safemem.Writer,
 		copied, targetErr := s.hemiGvisorTransferRingInPlace(
 			device, lane, mmid, ar.Start, buf[:want], linux.HEMI_USERSPACE_RING_OP_READ, enterFn)
 		if copied == 0 {
+			if faultAddr, ok := hemiGvisorFileFaultAddr(targetErr); ok && handleFault != nil {
+				if err := handleFault(faultAddr, hostarch.Read); err != nil {
+					return done, err
+				}
+				continue
+			}
 			if targetErr == nil {
 				targetErr = &platform.AddressSpaceIOStreamError{Err: fmt.Errorf("HEMI gVisor ring copied 0/%d bytes without an error", want)}
 			}
@@ -771,6 +815,12 @@ func (s *subprocess) copyInToIter(ars hostarch.AddrRangeSeq, dst safemem.Writer,
 			return done, writeErr
 		}
 		if targetErr != nil {
+			if faultAddr, ok := hemiGvisorFileFaultAddr(targetErr); ok && handleFault != nil {
+				if err := handleFault(faultAddr, hostarch.Read); err != nil {
+					return done, err
+				}
+				continue
+			}
 			return done, targetErr
 		}
 		if written != copied {
@@ -820,6 +870,9 @@ func (s *subprocess) EnsureAccess(addr hostarch.Addr, length uint64, at hostarch
 		return req.Done, fmt.Errorf("HEMI gVisor probe user ioctl: %w", errno)
 	}
 	if req.Result != 0 {
+		if unix.Errno(-req.Result) == unix.EAGAIN {
+			return req.Done, platform.AddressSpaceFileFault{Addr: addr + hostarch.Addr(req.Done)}
+		}
 		return req.Done, platform.SegmentationFault{Addr: addr + hostarch.Addr(req.Done)}
 	}
 	return req.Done, nil
@@ -972,6 +1025,9 @@ func (s *subprocess) hemiGvisorAtomicUint32(addr hostarch.Addr, op, old, new uin
 	if errno == unix.EFAULT {
 		return 0, platform.SegmentationFault{Addr: addr}
 	}
+	if errno == unix.EAGAIN {
+		return 0, platform.AddressSpaceFileFault{Addr: addr}
+	}
 	return 0, fmt.Errorf("HEMI gVisor atomic u32 ioctl: %w", errno)
 }
 
@@ -1010,6 +1066,43 @@ func (d *hemiGvisorDeviceState) registerFileTokens(mappable memmap.Mappable, ide
 	return fileToken, inodeToken, nil
 }
 
+func (d *hemiGvisorDeviceState) lookupFileToken(token uint64, mappable memmap.Mappable) (memmap.Mappable, memmap.MappingIdentity, error) {
+	d.tokenMu.Lock()
+	defer d.tokenMu.Unlock()
+	entry, ok := d.tokens[token]
+	if !ok || entry.kind != linux.HEMI_USERSPACE_RELEASE_FILE ||
+		entry.mappable != mappable || entry.identity == nil {
+		return nil, nil, fmt.Errorf("HEMI gVisor file fault returned stale token %d", token)
+	}
+	entry.identity.IncRef()
+	return entry.mappable, entry.identity, nil
+}
+
+// registerPageToken consumes one reference on fr. The Host returns the token
+// through DRAIN_RELEASES only after it has unpinned the pageVA supplied in
+// FILE_FAULT COMPLETE.
+func (d *hemiGvisorDeviceState) registerPageToken(file memmap.File, fr memmap.FileRange, block safemem.Block, mapping []byte) (uint64, error) {
+	d.tokenMu.Lock()
+	defer d.tokenMu.Unlock()
+	if d.nextToken == ^uint64(0) {
+		return 0, fmt.Errorf("HEMI gVisor token space exhausted")
+	}
+	if d.tokens == nil {
+		d.tokens = make(map[uint64]hemiGvisorToken)
+	}
+	d.nextToken++
+	token := d.nextToken
+	d.tokens[token] = hemiGvisorToken{
+		kind:      linux.HEMI_USERSPACE_RELEASE_PAGE,
+		file:      file,
+		fileRange: fr,
+		block:     block,
+		mapping:   mapping,
+		refs:      1,
+	}
+	return token, nil
+}
+
 func (d *hemiGvisorDeviceState) releaseToken(ctx context.Context, token uint64, kind uint32, count uint64) error {
 	if count == 0 {
 		return fmt.Errorf("HEMI gVisor release token %d has zero count", token)
@@ -1027,8 +1120,31 @@ func (d *hemiGvisorDeviceState) releaseToken(ctx context.Context, token uint64, 
 		d.tokens[token] = entry
 	}
 	d.tokenMu.Unlock()
-	for range count {
-		entry.identity.DecRef(ctx)
+	switch kind {
+	case linux.HEMI_USERSPACE_RELEASE_PAGE:
+		if count != 1 || entry.file == nil {
+			return fmt.Errorf("HEMI gVisor page token %d has invalid ownership", token)
+		}
+		var unmapErr error
+		if entry.mapping != nil {
+			unmapErr = memutil.UnmapSlice(entry.mapping)
+			if errno, ok := unmapErr.(unix.Errno); ok && errno == 0 {
+				unmapErr = nil
+			}
+		}
+		entry.file.DecRef(entry.fileRange)
+		if unmapErr != nil {
+			return fmt.Errorf("HEMI gVisor unmap page token %d: %w", token, unmapErr)
+		}
+	case linux.HEMI_USERSPACE_RELEASE_FILE, linux.HEMI_USERSPACE_RELEASE_INODE:
+		if entry.identity == nil {
+			return fmt.Errorf("HEMI gVisor token %d has no identity", token)
+		}
+		for range count {
+			entry.identity.DecRef(ctx)
+		}
+	default:
+		return fmt.Errorf("HEMI gVisor release token %d has unknown kind %d", token, kind)
 	}
 	return nil
 }
@@ -1066,6 +1182,241 @@ func (d *hemiGvisorDeviceState) drainReleases(ctx context.Context) error {
 				return err
 			}
 		}
+	}
+}
+
+func hemiGvisorPageFaultErrorCode(at hostarch.AccessType) uint64 {
+	errorCode := uint64(linux.X86_PF_USER)
+	if at.Write {
+		errorCode |= linux.X86_PF_WRITE
+	}
+	if at.Execute {
+		errorCode |= linux.X86_PF_INSTR
+	}
+	return errorCode
+}
+
+func (d *hemiGvisorDeviceState) prepareFilePage(ctx context.Context, t memmap.Translation, offset uint64) (linux.HemiUserspaceFilePage, error) {
+	delta := offset - t.Source.Start
+	if t.Offset > ^uint64(0)-delta {
+		return linux.HemiUserspaceFilePage{}, fmt.Errorf("HEMI gVisor translated file offset overflow")
+	}
+	fileOffset := t.Offset + delta
+	if fileOffset > ^uint64(0)-uint64(hostarch.PageSize) {
+		return linux.HemiUserspaceFilePage{}, fmt.Errorf("HEMI gVisor translated file page overflow")
+	}
+	fr := memmap.FileRange{Start: fileOffset, End: fileOffset + uint64(hostarch.PageSize)}
+	t.File.IncRef(fr, pgalloc.MemoryCgroupIDFromContext(ctx))
+
+	mapAccess := hostarch.Read
+	direct := t.Perms.Write
+	if direct {
+		mapAccess = hostarch.ReadWrite
+	}
+	blocks, mapErr := t.File.MapInternal(fr, mapAccess)
+	if mapErr == nil && direct && blocks.NumBlocks() == 1 &&
+		blocks.NumBytes() == uint64(hostarch.PageSize) &&
+		blocks.Head().Addr()%uintptr(hostarch.PageSize) == 0 {
+		block := blocks.Head()
+		token, err := d.registerPageToken(t.File, fr, block, nil)
+		if err != nil {
+			t.File.DecRef(fr)
+			return linux.HemiUserspaceFilePage{}, err
+		}
+		return linux.HemiUserspaceFilePage{
+			PageToken: token,
+			PageVA:    uint64(block.Addr()),
+		}, nil
+	}
+
+	mapping, err := memutil.MapSlice(
+		0, uintptr(hostarch.PageSize), unix.PROT_READ|unix.PROT_WRITE,
+		unix.MAP_PRIVATE|unix.MAP_ANONYMOUS, ^uintptr(0), 0)
+	if err != nil {
+		t.File.DecRef(fr)
+		return linux.HemiUserspaceFilePage{}, err
+	}
+	cleanup := func() {
+		_ = memutil.UnmapSlice(mapping)
+		t.File.DecRef(fr)
+	}
+
+	switch mapErr.(type) {
+	case nil:
+		n, err := safemem.CopySeq(
+			safemem.BlockSeqOf(safemem.BlockFromSafeSlice(mapping)), blocks)
+		if err != nil || n != uint64(hostarch.PageSize) {
+			cleanup()
+			if err != nil {
+				return linux.HemiUserspaceFilePage{}, fmt.Errorf("HEMI gVisor copy file page: %d/%d bytes: %w", n, hostarch.PageSize, err)
+			}
+			return linux.HemiUserspaceFilePage{}, fmt.Errorf("HEMI gVisor copy file page: %d/%d bytes", n, hostarch.PageSize)
+		}
+	case memmap.BufferedIOFallbackErr:
+		n, err := t.File.BufferReadAt(fileOffset, mapping)
+		if n > uint64(hostarch.PageSize) || (err != nil && !errors.Is(err, io.EOF)) {
+			cleanup()
+			return linux.HemiUserspaceFilePage{}, fmt.Errorf("HEMI gVisor buffered file page read: %d/%d bytes: %w", n, hostarch.PageSize, err)
+		}
+	default:
+		cleanup()
+		return linux.HemiUserspaceFilePage{}, fmt.Errorf("HEMI gVisor map file page: %w", mapErr)
+	}
+
+	block := safemem.BlockFromSafeSlice(mapping)
+	token, err := d.registerPageToken(t.File, fr, block, mapping)
+	if err != nil {
+		cleanup()
+		return linux.HemiUserspaceFilePage{}, err
+	}
+	return linux.HemiUserspaceFilePage{
+		PageToken: token,
+		PageVA:    uint64(block.Addr()),
+	}, nil
+}
+
+func (d *hemiGvisorDeviceState) rollbackPageTokens(ctx context.Context, pages []linux.HemiUserspaceFilePage) {
+	for _, page := range pages {
+		if err := d.releaseToken(ctx, page.PageToken, linux.HEMI_USERSPACE_RELEASE_PAGE, 1); err != nil {
+			log.Warningf("HEMI gVisor failed to roll back page token: %v", err)
+		}
+	}
+}
+
+// ResolveFileFault implements platform.AddressSpaceFilePager. MemoryManager
+// holds mappingMu for reading, so Translate is synchronized with invalidation
+// for the VMA whose tokens were registered by PublishPrivateFileMapping.
+func (s *subprocess) ResolveFileFault(ctx context.Context, addr hostarch.Addr, at hostarch.AccessType, mappable memmap.Mappable, faultMR, optionalMR memmap.MappableRange) (bool, error) {
+	if !hemiGvisorContainsUserMem(addr, 1) {
+		return false, nil
+	}
+	s.hemiGvisorPortalMu.Lock()
+	defer s.hemiGvisorPortalMu.Unlock()
+	device := s.hemiGvisorDevice
+	if device == nil || !s.hemiGvisorActive() {
+		return false, nil
+	}
+
+	req := linux.HemiUserspaceFileFault{
+		MMID:           s.hemiGvisorMMID,
+		Addr:           uint64(addr),
+		ErrorCode:      hemiGvisorPageFaultErrorCode(at),
+		Phase:          linux.HEMI_USERSPACE_FILE_FAULT_QUERY,
+		TargetTGID:     s.hemiGvisorTGID,
+		TargetDeviceFD: device.fd,
+	}
+	errno := hostsyscall.RawSyscallErrno6(
+		unix.SYS_IOCTL, uintptr(device.fd), uintptr(linux.HEMI_USERSPACE_FILE_FAULT),
+		uintptr(unsafe.Pointer(&req)), 0, 0, 0)
+	if errno != 0 {
+		return false, fmt.Errorf("HEMI gVisor file fault query ioctl: %w", errno)
+	}
+	if req.Result != 0 {
+		return false, fmt.Errorf("HEMI gVisor file fault query returned result %d", req.Result)
+	}
+	switch req.Action {
+	case linux.HEMI_USERSPACE_FILE_FAULT_HANDLED:
+		if req.NumPages != 0 {
+			return false, fmt.Errorf("HEMI gVisor handled file fault returned %d pages", req.NumPages)
+		}
+		return true, nil
+	case linux.HEMI_USERSPACE_FILE_FAULT_GUEST_HANDLE:
+		if req.NumPages != 0 {
+			return false, fmt.Errorf("HEMI gVisor fallback file fault returned %d pages", req.NumPages)
+		}
+		return false, nil
+	case linux.HEMI_USERSPACE_FILE_FAULT_GET_FILE_PAGE:
+	default:
+		return false, fmt.Errorf("HEMI gVisor file fault query returned unknown action %d", req.Action)
+	}
+	if req.NumPages == 0 || req.NumPages > linux.HEMI_USERSPACE_FILE_FAULT_MAX_PAGES ||
+		req.Offset != faultMR.Start {
+		return false, fmt.Errorf("HEMI gVisor file fault returned invalid range token=%d offset=%#x pages=%d",
+			req.FileToken, req.Offset, req.NumPages)
+	}
+
+	provider, identity, err := device.lookupFileToken(req.FileToken, mappable)
+	if err != nil {
+		return false, err
+	}
+	defer identity.DecRef(ctx)
+
+	end := req.Offset + uint64(req.NumPages)*uint64(hostarch.PageSize)
+	if end < req.Offset || end > optionalMR.End {
+		end = optionalMR.End
+	}
+	required := memmap.MappableRange{Start: req.Offset, End: end}
+	translateAccess := at
+	if translateAccess.Write {
+		translateAccess.Read = true
+		translateAccess.Write = false
+	}
+	translations, translateErr := provider.Translate(ctx, required, required, translateAccess)
+	if err := memmap.CheckTranslateResult(required, required, translateAccess, translations, translateErr); err != nil {
+		return false, err
+	}
+
+	pages := make([]linux.HemiUserspaceFilePage, 0, req.NumPages)
+	translation := 0
+	for offset := req.Offset; offset < end; offset += uint64(hostarch.PageSize) {
+		for translation < len(translations) && translations[translation].Source.End <= offset {
+			translation++
+		}
+		if translation == len(translations) ||
+			!translations[translation].Source.Contains(offset) ||
+			translations[translation].Source.End-offset < uint64(hostarch.PageSize) {
+			break
+		}
+		page, err := device.prepareFilePage(ctx, translations[translation], offset)
+		if err != nil {
+			if len(pages) == 0 {
+				return false, err
+			}
+			break
+		}
+		pages = append(pages, page)
+	}
+	if len(pages) == 0 {
+		if translateErr != nil {
+			return false, translateErr
+		}
+		return false, fmt.Errorf("HEMI gVisor file translation did not cover fault offset %#x", req.Offset)
+	}
+
+	req.Phase = linux.HEMI_USERSPACE_FILE_FAULT_COMPLETE
+	req.NumPages = uint32(len(pages))
+	copy(req.Pages[:], pages)
+	errno = hostsyscall.RawSyscallErrno6(
+		unix.SYS_IOCTL, uintptr(device.fd), uintptr(linux.HEMI_USERSPACE_FILE_FAULT),
+		uintptr(unsafe.Pointer(&req)), 0, 0, 0)
+	runtime.KeepAlive(pages)
+	if errno != 0 {
+		device.rollbackPageTokens(ctx, pages)
+		switch errno {
+		case unix.EALREADY:
+			return true, nil
+		case unix.EAGAIN:
+			return false, nil
+		default:
+			return false, fmt.Errorf("HEMI gVisor file fault complete ioctl: %w", errno)
+		}
+	}
+
+	// COMPLETE transfers every page token to the Host/core even when the
+	// resulting action falls back. Only DRAIN_RELEASES may release them now.
+	if err := device.drainReleases(ctx); err != nil {
+		return false, err
+	}
+	if req.Result != 0 {
+		return false, fmt.Errorf("HEMI gVisor file fault complete returned result %d", req.Result)
+	}
+	switch req.Action {
+	case linux.HEMI_USERSPACE_FILE_FAULT_HANDLED:
+		return true, nil
+	case linux.HEMI_USERSPACE_FILE_FAULT_GUEST_HANDLE:
+		return false, nil
+	default:
+		return false, fmt.Errorf("HEMI gVisor file fault complete returned unknown action %d", req.Action)
 	}
 }
 

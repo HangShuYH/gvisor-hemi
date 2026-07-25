@@ -302,8 +302,8 @@ func (mm *MemoryManager) asCopyOutApplicable(ctx context.Context, ar hostarch.Ad
 		if err == nil {
 			return done, nil
 		}
-		if f, ok := err.(platform.SegmentationFault); ok {
-			if err := mm.handleASIOFault(ctx, f.Addr, ar, hostarch.Write); err != nil {
+		if faultAddr, ok := addressSpaceFaultAddr(err); ok {
+			if err := mm.handleASIOFault(ctx, faultAddr, ar, hostarch.Write); err != nil {
 				return done, err
 			}
 			continue
@@ -385,8 +385,8 @@ func (mm *MemoryManager) asCopyInApplicable(ctx context.Context, ar hostarch.Add
 		if err == nil {
 			return done, nil
 		}
-		if f, ok := err.(platform.SegmentationFault); ok {
-			if err := mm.handleASIOFault(ctx, f.Addr, ar, hostarch.Read); err != nil {
+		if faultAddr, ok := addressSpaceFaultAddr(err); ok {
+			if err := mm.handleASIOFault(ctx, faultAddr, ar, hostarch.Read); err != nil {
 				return done, err
 			}
 			continue
@@ -463,8 +463,8 @@ func (mm *MemoryManager) asZeroOutApplicable(ctx context.Context, ar hostarch.Ad
 		if err == nil {
 			return done, nil
 		}
-		if f, ok := err.(platform.SegmentationFault); ok {
-			if err := mm.handleASIOFault(ctx, f.Addr, ar, hostarch.Write); err != nil {
+		if faultAddr, ok := addressSpaceFaultAddr(err); ok {
+			if err := mm.handleASIOFault(ctx, faultAddr, ar, hostarch.Write); err != nil {
 				return done, err
 			}
 			continue
@@ -600,7 +600,15 @@ func (mm *MemoryManager) CopyOutFromIter(ctx context.Context, ars hostarch.AddrR
 		return mm.withVecInternalMappings(ctx, ars, hostarch.Write, opts.IgnorePermissions, src.ReadToBlocks)
 	}
 	if stream, ok := mm.as.(platform.AddressSpaceIOIter); ok && allASIO {
-		n, err := stream.CopyOutFromIter(ars, src)
+		handleFault := func(addr hostarch.Addr, at hostarch.AccessType) error {
+			for ranges := ars; !ranges.IsEmpty(); ranges = ranges.Tail() {
+				if ar := ranges.Head(); ar.Contains(addr) {
+					return mm.handleASIOFault(ctx, addr, ar, at)
+				}
+			}
+			return translateIOError(ctx, fmt.Errorf("AddressSpaceIO stream fault %#x outside target ranges", addr))
+		}
+		n, err := stream.CopyOutFromIter(ars, src, handleFault)
 		if n < 0 || n > total {
 			return 0, translateIOError(ctx, fmt.Errorf("AddressSpaceIO stream copied %d/%d bytes", n, total))
 		}
@@ -646,7 +654,15 @@ func (mm *MemoryManager) CopyInToIter(ctx context.Context, ars hostarch.AddrRang
 		return mm.withVecInternalMappings(ctx, ars, hostarch.Read, opts.IgnorePermissions, dst.WriteFromBlocks)
 	}
 	if stream, ok := mm.as.(platform.AddressSpaceIOIter); ok && allASIO {
-		n, err := stream.CopyInToIter(ars, dst)
+		handleFault := func(addr hostarch.Addr, at hostarch.AccessType) error {
+			for ranges := ars; !ranges.IsEmpty(); ranges = ranges.Tail() {
+				if ar := ranges.Head(); ar.Contains(addr) {
+					return mm.handleASIOFault(ctx, addr, ar, at)
+				}
+			}
+			return translateIOError(ctx, fmt.Errorf("AddressSpaceIO stream fault %#x outside target ranges", addr))
+		}
+		n, err := stream.CopyInToIter(ars, dst, handleFault)
 		if n < 0 || n > total {
 			return 0, translateIOError(ctx, fmt.Errorf("AddressSpaceIO stream copied %d/%d bytes", n, total))
 		}
@@ -844,10 +860,33 @@ func (mm *MemoryManager) EnsurePMAsExist(ctx context.Context, addr hostarch.Addr
 }
 
 func (mm *MemoryManager) asEnsurePMAsExist(ctx context.Context, ensure platform.AddressSpaceIOEnsureAccess, ar hostarch.AddrRange, opts usermem.IOOpts) (int64, error) {
-	n, err := ensure.EnsureAccess(ar.Start, uint64(ar.Length()), hostarch.Write)
-	done := int64(n)
-	if _, unavailable := err.(platform.AddressSpaceIOUnavailable); !unavailable {
-		return done, translateIOError(ctx, err)
+	var done int64
+	for done < int64(ar.Length()) {
+		addr := ar.Start + hostarch.Addr(done)
+		remaining := int64(ar.Length()) - done
+		n, err := ensure.EnsureAccess(addr, uint64(remaining), hostarch.Write)
+		if n > uint64(remaining) {
+			return done, translateIOError(ctx, fmt.Errorf("AddressSpaceIO ensured invalid progress %d/%d bytes", n, remaining))
+		}
+		done += int64(n)
+		if faultAddr, fault := addressSpaceFaultAddr(err); fault {
+			if !ar.Contains(faultAddr) {
+				return done, translateIOError(ctx, fmt.Errorf("AddressSpaceIO fault %#x outside target range %v", faultAddr, ar))
+			}
+			if err := mm.handleASIOFault(ctx, faultAddr, ar, hostarch.Write); err != nil {
+				return done, err
+			}
+			continue
+		}
+		if _, unavailable := err.(platform.AddressSpaceIOUnavailable); unavailable {
+			break
+		}
+		if err != nil {
+			return done, translateIOError(ctx, err)
+		}
+		if n == 0 {
+			return done, translateIOError(ctx, fmt.Errorf("AddressSpaceIO ensured 0/%d bytes without an error", int64(ar.Length())-done))
+		}
 	}
 	if done == int64(ar.Length()) {
 		return done, nil
@@ -886,8 +925,8 @@ func (mm *MemoryManager) SwapUint32(ctx context.Context, addr hostarch.Addr, new
 			if err == nil {
 				return old, nil
 			}
-			if f, ok := err.(platform.SegmentationFault); ok {
-				if err := mm.handleASIOFault(ctx, f.Addr, ar, hostarch.ReadWrite); err != nil {
+			if faultAddr, ok := addressSpaceFaultAddr(err); ok {
+				if err := mm.handleASIOFault(ctx, faultAddr, ar, hostarch.ReadWrite); err != nil {
 					return 0, err
 				}
 				continue
@@ -942,8 +981,8 @@ func (mm *MemoryManager) CompareAndSwapUint32(ctx context.Context, addr hostarch
 			if err == nil {
 				return prev, nil
 			}
-			if f, ok := err.(platform.SegmentationFault); ok {
-				if err := mm.handleASIOFault(ctx, f.Addr, ar, hostarch.ReadWrite); err != nil {
+			if faultAddr, ok := addressSpaceFaultAddr(err); ok {
+				if err := mm.handleASIOFault(ctx, faultAddr, ar, hostarch.ReadWrite); err != nil {
 					return 0, err
 				}
 				continue
@@ -998,8 +1037,8 @@ func (mm *MemoryManager) LoadUint32(ctx context.Context, addr hostarch.Addr, opt
 			if err == nil {
 				return val, nil
 			}
-			if f, ok := err.(platform.SegmentationFault); ok {
-				if err := mm.handleASIOFault(ctx, f.Addr, ar, hostarch.Read); err != nil {
+			if faultAddr, ok := addressSpaceFaultAddr(err); ok {
+				if err := mm.handleASIOFault(ctx, faultAddr, ar, hostarch.Read); err != nil {
 					return 0, err
 				}
 				continue
@@ -1031,6 +1070,20 @@ func (mm *MemoryManager) LoadUint32(ctx context.Context, addr hostarch.Addr, opt
 	return val, err
 }
 
+func addressSpaceFaultAddr(err error) (hostarch.Addr, bool) {
+	if streamErr, ok := err.(*platform.AddressSpaceIOStreamError); ok {
+		err = streamErr.Err
+	}
+	switch fault := err.(type) {
+	case platform.SegmentationFault:
+		return fault.Addr, true
+	case platform.AddressSpaceFileFault:
+		return fault.Addr, true
+	default:
+		return 0, false
+	}
+}
+
 // handleASIOFault handles a page fault at address addr for an AddressSpaceIO
 // operation spanning ioar.
 //
@@ -1058,6 +1111,10 @@ func (mm *MemoryManager) handleASIOFault(ctx context.Context, addr hostarch.Addr
 			return translateIOError(ctx, err)
 		}
 		ar.End = vendaddr
+	}
+	if handled, err := mm.resolvePlatformFileFaultLocked(ctx, vseg, addr, at); handled || err != nil {
+		mm.mappingMu.RUnlock()
+		return translateIOError(ctx, err)
 	}
 
 	// Ensure that we have usable pmas.
