@@ -340,8 +340,7 @@ func New(opts platform.Options) (*Systrap, error) {
 
 // SupportsAddressSpaceIO implements platform.Platform.SupportsAddressSpaceIO.
 func (*Systrap) SupportsAddressSpaceIO() bool {
-	_, ok := hemiGvisorDeviceFD()
-	return ok
+	return hemiGvisorCurrentDevice() != nil
 }
 
 // MapUnit implements platform.Platform.MapUnit.

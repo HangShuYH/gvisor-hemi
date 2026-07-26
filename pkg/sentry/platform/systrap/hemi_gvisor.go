@@ -188,14 +188,6 @@ func hemiGvisorCurrentDevice() *hemiGvisorDeviceState {
 	return hemiGvisorDevice.state
 }
 
-func hemiGvisorDeviceFD() (int32, bool) {
-	state := hemiGvisorCurrentDevice()
-	if state != nil && state.fd >= 0 {
-		return state.fd, true
-	}
-	return -1, false
-}
-
 func hemiGvisorSetupRingLanes(deviceFD int32) chan *hemiGvisorRingLane {
 	lanes := make([]*hemiGvisorRingLane, 0, hemiGvisorRingLaneCount)
 	for range hemiGvisorRingLaneCount {
