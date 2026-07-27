@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"errors"
 	"math"
+	"sync/atomic"
 	"testing"
 	"unsafe"
 
@@ -154,6 +155,60 @@ func TestHemiGvisorFileTokenOwnership(t *testing.T) {
 	}
 	if err := device.releaseToken(ctx, fileToken, linux.HEMI_USERSPACE_RELEASE_FILE, 1); err == nil {
 		t.Fatal("duplicate file release unexpectedly succeeded")
+	}
+}
+
+func TestHemiGvisorDrainReleaseQueues(t *testing.T) {
+	ctx := context.Background()
+	identity := &hemiGvisorTestIdentity{}
+	const queueCount = 2
+	mapping := make([]byte, queueCount*linux.HEMI_USERSPACE_RELEASE_QUEUE_STRIDE)
+	device := &hemiGvisorDeviceState{
+		tokens:         make(map[uint64]hemiGvisorToken),
+		releaseMapping: mapping,
+		releaseCount:   queueCount,
+		releaseStride:  linux.HEMI_USERSPACE_RELEASE_QUEUE_STRIDE,
+	}
+	fileToken, inodeToken, err := device.registerFileTokens(
+		&hemiGvisorTestMapping{}, identity)
+	if err != nil {
+		t.Fatalf("registerFileTokens: %v", err)
+	}
+	tokens := []struct {
+		token uint64
+		kind  uint32
+	}{
+		{token: fileToken, kind: linux.HEMI_USERSPACE_RELEASE_FILE},
+		{token: inodeToken, kind: linux.HEMI_USERSPACE_RELEASE_INODE},
+	}
+	for queue, token := range tokens {
+		offset := queue * linux.HEMI_USERSPACE_RELEASE_QUEUE_STRIDE
+		ring := (*linux.HemiUserspaceReleaseRing)(
+			unsafe.Pointer(&mapping[offset]))
+		ring.Records[0] = linux.HemiUserspaceReleaseRecord{
+			Token: token.token,
+			Count: 1,
+			Type:  token.kind,
+		}
+		atomic.StoreUint32(&ring.Tail, 1)
+	}
+
+	if err := device.drainReleases(ctx); err != nil {
+		t.Fatalf("drainReleases: %v", err)
+	}
+	if got := identity.refs; got != 0 {
+		t.Fatalf("identity refs after drain = %d, want 0", got)
+	}
+	if got := len(device.tokens); got != 0 {
+		t.Fatalf("registry length after drain = %d, want 0", got)
+	}
+	for queue := range tokens {
+		offset := queue * linux.HEMI_USERSPACE_RELEASE_QUEUE_STRIDE
+		ring := (*linux.HemiUserspaceReleaseRing)(
+			unsafe.Pointer(&mapping[offset]))
+		if got := atomic.LoadUint32(&ring.Head); got != 1 {
+			t.Errorf("queue %d head after drain = %d, want 1", queue, got)
+		}
 	}
 }
 
@@ -356,8 +411,18 @@ func TestHemiGvisorRingABILayout(t *testing.T) {
 	if got, want := unsafe.Sizeof(linux.HemiUserspaceMapFile{}), uintptr(96); got != want {
 		t.Fatalf("sizeof(HemiUserspaceMapFile) = %d, want %d", got, want)
 	}
-	if got, want := unsafe.Sizeof(linux.HemiUserspaceReleaseBatch{}), uintptr(776); got != want {
-		t.Fatalf("sizeof(HemiUserspaceReleaseBatch) = %d, want %d", got, want)
+	releaseRing := linux.HemiUserspaceReleaseRing{}
+	if got, want := unsafe.Sizeof(releaseRing), uintptr(1664); got != want {
+		t.Fatalf("sizeof(HemiUserspaceReleaseRing) = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(releaseRing.Tail), uintptr(64); got != want {
+		t.Fatalf("offsetof(HemiUserspaceReleaseRing.Tail) = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(releaseRing.Records), uintptr(128); got != want {
+		t.Fatalf("offsetof(HemiUserspaceReleaseRing.Records) = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Sizeof(linux.HemiUserspaceReleaseSetup{}), uintptr(24); got != want {
+		t.Fatalf("sizeof(HemiUserspaceReleaseSetup) = %d, want %d", got, want)
 	}
 }
 

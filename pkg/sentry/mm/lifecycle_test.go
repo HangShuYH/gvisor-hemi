@@ -15,6 +15,7 @@
 package mm
 
 import (
+	"sync/atomic"
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -47,7 +48,12 @@ type forkTrackingAddressSpace struct {
 	ensureAccess          hostarch.AccessType
 	ignorePermissionsRead bool
 	copyInCalls           int
+	copyOutCalls          int
 	copyInData            []byte
+	atomicValue           uint32
+	swapUint32Calls       int
+	compareAndSwapCalls   int
+	loadUint32Calls       int
 }
 
 func (as *forkTrackingAddressSpace) ForkAddressSpaceFrom(source platform.AddressSpace) error {
@@ -69,6 +75,31 @@ func (as *forkTrackingAddressSpace) AddressSpaceIOReadIgnoresPermissions() bool 
 func (as *forkTrackingAddressSpace) CopyIn(addr hostarch.Addr, dst []byte) (int, error) {
 	as.copyInCalls++
 	return copy(dst, as.copyInData), nil
+}
+
+func (as *forkTrackingAddressSpace) CopyOut(addr hostarch.Addr, src []byte) (int, error) {
+	as.copyOutCalls++
+	return len(src), nil
+}
+
+func (as *forkTrackingAddressSpace) SwapUint32(addr hostarch.Addr, new uint32) (uint32, error) {
+	as.swapUint32Calls++
+	return atomic.SwapUint32(&as.atomicValue, new), nil
+}
+
+func (as *forkTrackingAddressSpace) CompareAndSwapUint32(addr hostarch.Addr, old, new uint32) (uint32, error) {
+	as.compareAndSwapCalls++
+	for {
+		prev := atomic.LoadUint32(&as.atomicValue)
+		if prev != old || atomic.CompareAndSwapUint32(&as.atomicValue, old, new) {
+			return prev, nil
+		}
+	}
+}
+
+func (as *forkTrackingAddressSpace) LoadUint32(addr hostarch.Addr) (uint32, error) {
+	as.loadUint32Calls++
+	return atomic.LoadUint32(&as.atomicValue), nil
 }
 
 func TestForkCopiesPlatformAddressSpaceState(t *testing.T) {
@@ -148,5 +179,51 @@ func TestCopyInIgnorePermissionsUsesCapableAddressSpace(t *testing.T) {
 	}
 	if got[0] != 0x0f || got[1] != 0xa2 {
 		t.Fatalf("CopyIn returned %x, want 0fa2", got)
+	}
+}
+
+func TestAtomicUint32UsesAddressSpaceIO(t *testing.T) {
+	ctx := contexttest.Context(t)
+	p := &forkTrackingPlatform{Platform: platform.FromContext(ctx)}
+	mm, err := NewMemoryManager(p, pgalloc.MemoryFileFromContext(ctx))
+	if err != nil {
+		t.Fatalf("NewMemoryManager: %v", err)
+	}
+	defer mm.DecUsers(ctx)
+
+	mm.haveASIO = true
+	mm.layout.MaxAddr = p.MaxUserAddress()
+	as := p.addressSpaces[0]
+	addr := p.MinUserAddress()
+	atomic.StoreUint32(&as.atomicValue, 7)
+
+	if old, err := mm.SwapUint32(ctx, addr, 11, usermem.IOOpts{}); err != nil {
+		t.Fatalf("SwapUint32: %v", err)
+	} else if old != 7 {
+		t.Fatalf("SwapUint32 returned %d, want 7", old)
+	}
+	if prev, err := mm.CompareAndSwapUint32(ctx, addr, 11, 13, usermem.IOOpts{}); err != nil {
+		t.Fatalf("CompareAndSwapUint32 success: %v", err)
+	} else if prev != 11 {
+		t.Fatalf("CompareAndSwapUint32 success returned %d, want 11", prev)
+	}
+	if prev, err := mm.CompareAndSwapUint32(ctx, addr, 11, 17, usermem.IOOpts{}); err != nil {
+		t.Fatalf("CompareAndSwapUint32 failure: %v", err)
+	} else if prev != 13 {
+		t.Fatalf("CompareAndSwapUint32 failure returned %d, want 13", prev)
+	}
+	if value, err := mm.LoadUint32(ctx, addr, usermem.IOOpts{}); err != nil {
+		t.Fatalf("LoadUint32: %v", err)
+	} else if value != 13 {
+		t.Fatalf("LoadUint32 returned %d, want 13", value)
+	}
+
+	if as.swapUint32Calls != 1 || as.compareAndSwapCalls != 2 || as.loadUint32Calls != 1 {
+		t.Fatalf("AddressSpace atomic calls = swap:%d cas:%d load:%d, want 1/2/1",
+			as.swapUint32Calls, as.compareAndSwapCalls, as.loadUint32Calls)
+	}
+	if as.copyInCalls != 0 || as.copyOutCalls != 0 {
+		t.Fatalf("atomic operations used CopyIn/CopyOut %d/%d times, want 0/0",
+			as.copyInCalls, as.copyOutCalls)
 	}
 }

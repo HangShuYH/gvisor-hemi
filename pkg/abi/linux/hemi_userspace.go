@@ -17,32 +17,11 @@ package linux
 import "structs"
 
 const (
-	HEMI_USERSPACE_IOCTL_TYPE  = uint32('H')
-	HEMI_USERSPACE_ABI_VERSION = uint32(1)
+	HEMI_USERSPACE_IOCTL_TYPE = uint32('H')
 
 	HEMI_USERSPACE_VMAR_START = uint64(0x0000610000000000)
 	HEMI_USERSPACE_VMAR_END   = uint64(0x0000620000000000)
-
-	HEMI_USERSPACE_ROUTE_SUD         = uint32(1)
-	HEMI_USERSPACE_ROUTE_SYSCALL_EMU = uint32(2)
-
-	HEMI_USERSPACE_INIT_ANON_DATA    = uint32(1)
-	HEMI_USERSPACE_INIT_FILE_PRIVATE = uint32(2)
 )
-
-// HemiUserspaceInit is struct hemi_userspace_init.
-//
-// +marshal
-type HemiUserspaceInit struct {
-	_          structs.HostLayout
-	ABIVersion uint32
-	Route      uint32
-	Flags      uint32
-	Reserved   uint32
-	TaskSize   uint64
-	StubStart  uint64
-	StubEnd    uint64
-}
 
 // HemiUserspaceAllocMM is struct hemi_userspace_alloc_mm.
 //
@@ -74,10 +53,9 @@ type HemiUserspaceFreeMM struct {
 }
 
 var (
-	HEMI_USERSPACE_INIT_SESSION = IOW(HEMI_USERSPACE_IOCTL_TYPE, 0x01, uint32((*HemiUserspaceInit)(nil).SizeBytes()))
-	HEMI_USERSPACE_ALLOC_MM     = IOW(HEMI_USERSPACE_IOCTL_TYPE, 0x02, uint32((*HemiUserspaceAllocMM)(nil).SizeBytes()))
-	HEMI_USERSPACE_FORK_MM      = IOW(HEMI_USERSPACE_IOCTL_TYPE, 0x03, uint32((*HemiUserspaceForkMM)(nil).SizeBytes()))
-	HEMI_USERSPACE_FREE_MM      = IOW(HEMI_USERSPACE_IOCTL_TYPE, 0x04, uint32((*HemiUserspaceFreeMM)(nil).SizeBytes()))
+	HEMI_USERSPACE_ALLOC_MM = IOW(HEMI_USERSPACE_IOCTL_TYPE, 0x02, uint32((*HemiUserspaceAllocMM)(nil).SizeBytes()))
+	HEMI_USERSPACE_FORK_MM  = IOW(HEMI_USERSPACE_IOCTL_TYPE, 0x03, uint32((*HemiUserspaceForkMM)(nil).SizeBytes()))
+	HEMI_USERSPACE_FREE_MM  = IOW(HEMI_USERSPACE_IOCTL_TYPE, 0x04, uint32((*HemiUserspaceFreeMM)(nil).SizeBytes()))
 )
 
 const (
@@ -263,11 +241,12 @@ type HemiUserspaceFileFault struct {
 var HEMI_USERSPACE_FILE_FAULT = IOWR(HEMI_USERSPACE_IOCTL_TYPE, 0x0b, uint32((*HemiUserspaceFileFault)(nil).SizeBytes()))
 
 const (
-	HEMI_USERSPACE_RELEASE_MAX = 32
-
 	HEMI_USERSPACE_RELEASE_PAGE  = uint32(1)
 	HEMI_USERSPACE_RELEASE_FILE  = uint32(2)
 	HEMI_USERSPACE_RELEASE_INODE = uint32(3)
+
+	HEMI_USERSPACE_RELEASE_RING_ENTRIES = 64
+	HEMI_USERSPACE_RELEASE_QUEUE_STRIDE = 2048
 )
 
 // HemiUserspaceReleaseRecord is struct hemi_userspace_release_record.
@@ -281,14 +260,27 @@ type HemiUserspaceReleaseRecord struct {
 	Reserved uint32
 }
 
-// HemiUserspaceReleaseBatch is struct hemi_userspace_release_batch.
+// HemiUserspaceReleaseRing is struct hemi_userspace_release_ring.
 //
 // +marshal
-type HemiUserspaceReleaseBatch struct {
-	_       structs.HostLayout
-	Count   uint32
-	Flags   uint32
-	Records [HEMI_USERSPACE_RELEASE_MAX]HemiUserspaceReleaseRecord
+type HemiUserspaceReleaseRing struct {
+	_            structs.HostLayout
+	Head         uint32
+	HeadReserved [15]uint32
+	Tail         uint32
+	TailReserved [15]uint32
+	Records      [HEMI_USERSPACE_RELEASE_RING_ENTRIES]HemiUserspaceReleaseRecord
 }
 
-var HEMI_USERSPACE_DRAIN_RELEASES = IOWR(HEMI_USERSPACE_IOCTL_TYPE, 0x0c, uint32((*HemiUserspaceReleaseBatch)(nil).SizeBytes()))
+// HemiUserspaceReleaseSetup is struct hemi_userspace_release_setup.
+//
+// +marshal
+type HemiUserspaceReleaseSetup struct {
+	_           structs.HostLayout
+	MmapOffset  uint64
+	MmapSize    uint64
+	QueueCount  uint32
+	QueueStride uint32
+}
+
+var HEMI_USERSPACE_SETUP_RELEASES = IOR(HEMI_USERSPACE_IOCTL_TYPE, 0x0c, uint32((*HemiUserspaceReleaseSetup)(nil).SizeBytes()))

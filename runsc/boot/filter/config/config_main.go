@@ -116,11 +116,6 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 	unix.SYS_IOCTL: seccomp.Or{
 		seccomp.PerArg{
 			seccomp.NonNegativeFD{},
-			seccomp.EqualTo(linux.HEMI_USERSPACE_INIT_SESSION),
-			seccomp.AnyValue{},
-		},
-		seccomp.PerArg{
-			seccomp.NonNegativeFD{},
 			seccomp.EqualTo(linux.HEMI_USERSPACE_ALLOC_MM),
 			seccomp.AnyValue{},
 		},
@@ -171,7 +166,7 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 		},
 		seccomp.PerArg{
 			seccomp.NonNegativeFD{},
-			seccomp.EqualTo(linux.HEMI_USERSPACE_DRAIN_RELEASES),
+			seccomp.EqualTo(linux.HEMI_USERSPACE_SETUP_RELEASES),
 			seccomp.AnyValue{},
 		},
 		// These commands are needed for host FD.

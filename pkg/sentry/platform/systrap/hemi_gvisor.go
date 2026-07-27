@@ -20,6 +20,7 @@ import (
 	"io"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -100,6 +101,11 @@ type hemiGvisorDeviceState struct {
 	tokenMu   sync.Mutex
 	nextToken uint64
 	tokens    map[uint64]hemiGvisorToken
+
+	releaseMapping []byte
+	releaseCount   uint32
+	releaseStride  uint32
+	releaseWake    chan struct{}
 }
 
 type hemiGvisorToken struct {
@@ -146,23 +152,20 @@ func hemiGvisorSetDeviceFD(deviceFile *fd.FD) {
 	if deviceFile == nil {
 		return
 	}
-	init := linux.HemiUserspaceInit{
-		ABIVersion: linux.HEMI_USERSPACE_ABI_VERSION,
-		Route:      linux.HEMI_USERSPACE_ROUTE_SUD,
-		Flags: linux.HEMI_USERSPACE_INIT_ANON_DATA |
-			linux.HEMI_USERSPACE_INIT_FILE_PRIVATE,
-	}
 	deviceFD := int32(deviceFile.FD())
-	if errno := hostsyscall.RawSyscallErrno6(
-		unix.SYS_IOCTL, uintptr(deviceFD), uintptr(linux.HEMI_USERSPACE_INIT_SESSION),
-		uintptr(unsafe.Pointer(&init)), 0, 0, 0); errno != 0 {
-		log.Warningf("HEMI userspace session initialization failed; disabling HEMI: %v", errno)
+	releaseMapping, releaseSetup, err := hemiGvisorSetupReleaseQueues(deviceFD)
+	if err != nil {
+		log.Warningf("HEMI release queue setup failed; disabling HEMI: %v", err)
 		return
 	}
 	state := &hemiGvisorDeviceState{
-		file:   deviceFile,
-		fd:     deviceFD,
-		tokens: make(map[uint64]hemiGvisorToken),
+		file:           deviceFile,
+		fd:             deviceFD,
+		tokens:         make(map[uint64]hemiGvisorToken),
+		releaseMapping: releaseMapping,
+		releaseCount:   releaseSetup.QueueCount,
+		releaseStride:  releaseSetup.QueueStride,
+		releaseWake:    make(chan struct{}, 1),
 	}
 	state.lanes = hemiGvisorSetupRingLanes(state.fd)
 
@@ -175,10 +178,24 @@ func hemiGvisorSetDeviceFD(deviceFile *fd.FD) {
 func (d *hemiGvisorDeviceState) drainReleaseLoop() {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
-	for range ticker.C {
+	for {
+		select {
+		case <-ticker.C:
+		case <-d.releaseWake:
+		}
 		if err := d.drainReleases(context.Background()); err != nil {
 			log.Warningf("HEMI gVisor periodic release drain failed: %v", err)
 		}
+	}
+}
+
+func (d *hemiGvisorDeviceState) notifyReleaseDrain() {
+	if d == nil || d.releaseWake == nil {
+		return
+	}
+	select {
+	case d.releaseWake <- struct{}{}:
+	default:
 	}
 }
 
@@ -186,6 +203,36 @@ func hemiGvisorCurrentDevice() *hemiGvisorDeviceState {
 	hemiGvisorDevice.Lock()
 	defer hemiGvisorDevice.Unlock()
 	return hemiGvisorDevice.state
+}
+
+func hemiGvisorSetupReleaseQueues(deviceFD int32) ([]byte, linux.HemiUserspaceReleaseSetup, error) {
+	setup := linux.HemiUserspaceReleaseSetup{}
+	errno := hostsyscall.RawSyscallErrno6(
+		unix.SYS_IOCTL, uintptr(deviceFD), uintptr(linux.HEMI_USERSPACE_SETUP_RELEASES),
+		uintptr(unsafe.Pointer(&setup)), 0, 0, 0)
+	if errno != 0 {
+		return nil, setup, errno
+	}
+	ringSize := uint64((*linux.HemiUserspaceReleaseRing)(nil).SizeBytes())
+	required := uint64(setup.QueueCount) * uint64(setup.QueueStride)
+	if setup.QueueCount == 0 ||
+		setup.QueueStride < uint32(ringSize) ||
+		setup.QueueStride != linux.HEMI_USERSPACE_RELEASE_QUEUE_STRIDE ||
+		required > setup.MmapSize ||
+		setup.MmapSize == 0 ||
+		setup.MmapSize%uint64(hostarch.PageSize) != 0 ||
+		setup.MmapOffset%uint64(hostarch.PageSize) != 0 ||
+		uint64(uintptr(setup.MmapSize)) != setup.MmapSize ||
+		uint64(uintptr(setup.MmapOffset)) != setup.MmapOffset {
+		return nil, setup, fmt.Errorf("invalid HEMI release queue setup: %+v", setup)
+	}
+	mapping, err := memutil.MapSlice(
+		0, uintptr(setup.MmapSize), unix.PROT_READ|unix.PROT_WRITE,
+		unix.MAP_SHARED, uintptr(uint32(deviceFD)), uintptr(setup.MmapOffset))
+	if err != nil {
+		return nil, setup, err
+	}
+	return mapping, setup, nil
 }
 
 func hemiGvisorSetupRingLanes(deviceFD int32) chan *hemiGvisorRingLane {
@@ -452,7 +499,8 @@ func (s *subprocess) hemiGvisorFreeMMLocked() error {
 		return fmt.Errorf("HEMI gVisor free mm ioctl for MMID %d: %w", mmid, errno)
 	}
 	s.hemiGvisorMMID = 0
-	return device.drainReleases(context.Background())
+	device.notifyReleaseDrain()
+	return nil
 }
 
 // ForkAddressSpaceFrom implements platform.AddressSpaceForker. The destination
@@ -1041,7 +1089,7 @@ func (d *hemiGvisorDeviceState) registerFileTokens(mappable memmap.Mappable, ide
 
 	// The registry owns one identity reference for each token. These
 	// references keep the provider valid after the Guest file descriptor is
-	// closed and are released only after Host DRAIN_RELEASES.
+	// closed and are released only after the Host publishes a release record.
 	identity.IncRef()
 	identity.IncRef()
 	d.tokens[fileToken] = hemiGvisorToken{
@@ -1071,8 +1119,8 @@ func (d *hemiGvisorDeviceState) lookupFileToken(token uint64, mappable memmap.Ma
 }
 
 // registerPageToken consumes one reference on fr. The Host returns the token
-// through DRAIN_RELEASES only after it has unpinned the pageVA supplied in
-// FILE_FAULT COMPLETE.
+// through the shared release queues only after it has unpinned the pageVA
+// supplied in FILE_FAULT COMPLETE.
 func (d *hemiGvisorDeviceState) registerPageToken(file memmap.File, fr memmap.FileRange, block safemem.Block, mapping []byte) (uint64, error) {
 	d.tokenMu.Lock()
 	defer d.tokenMu.Unlock()
@@ -1151,30 +1199,29 @@ func (d *hemiGvisorDeviceState) rollbackFileTokens(ctx context.Context, fileToke
 }
 
 func (d *hemiGvisorDeviceState) drainReleases(ctx context.Context) error {
-	for {
-		batch := linux.HemiUserspaceReleaseBatch{}
-		errno := hostsyscall.RawSyscallErrno6(
-			unix.SYS_IOCTL, uintptr(d.fd), uintptr(linux.HEMI_USERSPACE_DRAIN_RELEASES),
-			uintptr(unsafe.Pointer(&batch)), 0, 0, 0)
-		if errno != 0 {
-			return fmt.Errorf("HEMI gVisor drain releases ioctl: %w", errno)
+	for queue := uint32(0); queue < d.releaseCount; queue++ {
+		offset := uint64(queue) * uint64(d.releaseStride)
+		ring := (*linux.HemiUserspaceReleaseRing)(
+			unsafe.Pointer(&d.releaseMapping[offset]))
+		head := atomic.LoadUint32(&ring.Head)
+		tail := atomic.LoadUint32(&ring.Tail)
+		if head >= linux.HEMI_USERSPACE_RELEASE_RING_ENTRIES ||
+			tail >= linux.HEMI_USERSPACE_RELEASE_RING_ENTRIES {
+			return fmt.Errorf("HEMI gVisor release queue %d has invalid indices %d/%d", queue, head, tail)
 		}
-		if batch.Count > linux.HEMI_USERSPACE_RELEASE_MAX || batch.Flags != 0 {
-			return fmt.Errorf("HEMI gVisor drain returned invalid header: count=%d flags=%d", batch.Count, batch.Flags)
-		}
-		if batch.Count == 0 {
-			return nil
-		}
-		for i := uint32(0); i < batch.Count; i++ {
-			record := batch.Records[i]
-			if record.Reserved != 0 {
-				return fmt.Errorf("HEMI gVisor drain returned reserved data for token %d", record.Token)
+		for head != tail {
+			record := ring.Records[head]
+			if record.Reserved != 0 || record.Token == 0 || record.Count == 0 {
+				return fmt.Errorf("HEMI gVisor release queue %d returned invalid record %+v", queue, record)
 			}
 			if err := d.releaseToken(ctx, record.Token, record.Type, record.Count); err != nil {
 				return err
 			}
+			head = (head + 1) % linux.HEMI_USERSPACE_RELEASE_RING_ENTRIES
+			atomic.StoreUint32(&ring.Head, head)
 		}
 	}
+	return nil
 }
 
 func hemiGvisorPageFaultErrorCode(at hostarch.AccessType) uint64 {
@@ -1395,10 +1442,8 @@ func (s *subprocess) ResolveFileFault(ctx context.Context, addr hostarch.Addr, a
 	}
 
 	// COMPLETE transfers every page token to the Host/core even when the
-	// resulting action falls back. Only DRAIN_RELEASES may release them now.
-	if err := device.drainReleases(ctx); err != nil {
-		return false, err
-	}
+	// resulting action falls back. The release goroutine owns them from here.
+	device.notifyReleaseDrain()
 	if req.Result != 0 {
 		return false, fmt.Errorf("HEMI gVisor file fault complete returned result %d", req.Result)
 	}
@@ -1457,11 +1502,8 @@ func (s *subprocess) PublishPrivateFileMapping(ctx context.Context, addr hostarc
 	}
 
 	// Core owns the tokens once MAP_FILE reaches it, including GuestHandle
-	// and semantic-error results. DRAIN_RELEASES is the only valid release
-	// path from this point.
-	if err := device.drainReleases(ctx); err != nil {
-		return err
-	}
+	// and semantic-error results. The release goroutine owns them from here.
+	device.notifyReleaseDrain()
 	if req.Reserved != 0 {
 		return fmt.Errorf("HEMI gVisor map file returned reserved data")
 	}
