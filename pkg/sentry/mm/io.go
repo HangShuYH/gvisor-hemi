@@ -1092,6 +1092,12 @@ func addressSpaceFaultAddr(err error) (hostarch.Addr, bool) {
 //   - ioar.Length() != 0.
 //   - ioar.Contains(addr).
 func (mm *MemoryManager) handleASIOFault(ctx context.Context, addr hostarch.Addr, ioar hostarch.AddrRange, at hostarch.AccessType) error {
+	if pager, ok := mm.as.(platform.AddressSpaceFilePager); ok {
+		if handled, err := pager.ResolveFileFault(ctx, addr, at); handled || err != nil {
+			return translateIOError(ctx, err)
+		}
+	}
+
 	// Try to map all remaining pages in the I/O operation. This RoundUp can't
 	// overflow because otherwise it would have been caught by CheckIORange.
 	end, _ := ioar.End.RoundUp()
@@ -1112,11 +1118,6 @@ func (mm *MemoryManager) handleASIOFault(ctx context.Context, addr hostarch.Addr
 		}
 		ar.End = vendaddr
 	}
-	if handled, err := mm.resolvePlatformFileFaultLocked(ctx, vseg, addr, at); handled || err != nil {
-		mm.mappingMu.RUnlock()
-		return translateIOError(ctx, err)
-	}
-
 	// Ensure that we have usable pmas.
 	mm.activeMu.Lock()
 	pseg, pend, err := mm.getPMAsLocked(ctx, vseg, ar, at, true /* callerIndirectCommit */)

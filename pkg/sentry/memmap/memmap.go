@@ -386,12 +386,6 @@ type MMapOpts struct {
 	// If Force is true, Unmap and Fixed must be true.
 	Force bool
 
-	// AllowPlatformReserved permits a fixed private file mapping to overlap
-	// the range reserved by platform.AddressSpaceReservedRange. It is used
-	// only when the platform also publishes the same VMA to its authoritative
-	// address space.
-	AllowPlatformReserved bool
-
 	// If RequirePlatformEffect is false, PlatformEffect is best-effort;
 	// failure to create mappings in the platform.AddressSpace are silently
 	// ignored. If RequirePlatformEffect is true, failure to create mappings in

@@ -35,6 +35,11 @@ import (
 // Preconditions: mm.as != nil.
 func (mm *MemoryManager) HandleUserFault(ctx context.Context, addr hostarch.Addr, at hostarch.AccessType, sp hostarch.Addr) error {
 	addr = hostarch.UntaggedUserAddr(addr)
+	if pager, ok := mm.as.(platform.AddressSpaceFilePager); ok {
+		if handled, err := pager.ResolveFileFault(ctx, addr, at); handled || err != nil {
+			return err
+		}
+	}
 	ar, ok := addr.RoundDown().ToRange(hostarch.PageSize)
 	if !ok {
 		return linuxerr.EFAULT
@@ -52,11 +57,6 @@ func (mm *MemoryManager) HandleUserFault(ctx context.Context, addr hostarch.Addr
 		mm.mappingMu.RUnlock()
 		return err
 	}
-	if handled, err := mm.resolvePlatformFileFaultLocked(ctx, vseg, addr, at); handled || err != nil {
-		mm.mappingMu.RUnlock()
-		return err
-	}
-
 	// Ensure that we have a usable pma.
 	mm.activeMu.Lock()
 	pseg, _, err := mm.getPMAsLocked(ctx, vseg, ar, at, true /* callerIndirectCommit */)
@@ -74,33 +74,6 @@ func (mm *MemoryManager) HandleUserFault(ctx context.Context, addr hostarch.Addr
 	err = mm.mapASLocked(ctx, pseg, ar, memmap.PlatformEffectDefault)
 	mm.activeMu.RUnlock()
 	return err
-}
-
-// resolvePlatformFileFaultLocked asks the platform to provide a file-backed
-// page before MemoryManager creates a PMA for the same fault. Holding
-// mappingMu across this call satisfies Mappable.Translate's invalidation
-// synchronization requirement.
-//
-// Preconditions:
-//   - mm.mappingMu is locked for reading.
-//   - vseg contains addr.
-func (mm *MemoryManager) resolvePlatformFileFaultLocked(ctx context.Context, vseg vmaIterator, addr hostarch.Addr, at hostarch.AccessType) (bool, error) {
-	pager, ok := mm.as.(platform.AddressSpaceFilePager)
-	if !ok {
-		return false, nil
-	}
-	vma := vseg.ValuePtr()
-	if !vma.private || vma.mappable == nil {
-		return false, nil
-	}
-	faultAR, ok := addr.RoundDown().ToRange(hostarch.PageSize)
-	if !ok || !vseg.Range().IsSupersetOf(faultAR) {
-		return false, nil
-	}
-	optionalAR := hostarch.AddrRange{Start: faultAR.Start, End: vseg.End()}
-	return pager.ResolveFileFault(
-		ctx, addr, at, vma.mappable,
-		vseg.mappableRangeOf(faultAR), vseg.mappableRangeOf(optionalAR))
 }
 
 // MMap establishes a memory mapping.
@@ -145,11 +118,6 @@ func (mm *MemoryManager) MMap(ctx context.Context, opts memmap.MMapOpts) (hostar
 	if opts.GrowsDown && opts.Mappable != nil {
 		return 0, linuxerr.EINVAL
 	}
-	if opts.AllowPlatformReserved &&
-		(!opts.Fixed || !opts.Private || opts.Mappable == nil) {
-		return 0, linuxerr.EINVAL
-	}
-
 	// Get the new vma.
 	mm.mappingMu.Lock()
 	if opts.MLockMode < mm.defMLockMode {

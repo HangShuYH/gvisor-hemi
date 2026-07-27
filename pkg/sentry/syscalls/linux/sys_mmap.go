@@ -18,6 +18,7 @@ import (
 	"bytes"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
@@ -26,7 +27,29 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/usermem"
 )
+
+type privateFileProvider struct {
+	file *vfs.FileDescription
+}
+
+func (p *privateFileProvider) IncRef() {
+	p.file.IncRef()
+}
+
+func (p *privateFileProvider) DecRef(ctx context.Context) {
+	p.file.DecRef(ctx)
+}
+
+func (p *privateFileProvider) ReadAt(ctx context.Context, dst []byte, offset uint64) (int, error) {
+	if offset > uint64(^uint64(0)>>1) {
+		return 0, linuxerr.EOVERFLOW
+	}
+	n, err := p.file.PRead(ctx, usermem.BytesIOSequence(dst), int64(offset), vfs.ReadOptions{})
+	return int(n), err
+}
 
 // Brk implements linux syscall brk(2).
 func Brk(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
@@ -82,9 +105,10 @@ func Mmap(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *
 		}
 	}()
 
+	var file *vfs.FileDescription
 	if !anon {
 		// Convert the passed FD to a file reference.
-		file := t.GetFile(fd)
+		file = t.GetFile(fd)
 		if file == nil {
 			return 0, nil, linuxerr.EBADF
 		}
@@ -123,10 +147,6 @@ func Mmap(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *
 		if err := file.ConfigureMMap(t, &opts); err != nil {
 			return 0, nil, err
 		}
-		if fixed && private {
-			_, opts.AllowPlatformReserved =
-				t.MemoryManager().AddressSpace().(platform.AddressSpacePrivateFileMapper)
-		}
 	} else if shared {
 		// Back shared anonymous mappings with an anonymous tmpfs file.
 		opts.Offset = 0
@@ -142,19 +162,23 @@ func Mmap(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *
 		opts.NameMut = memmap.NameMutAnon
 	}
 
-	rv, err := t.MemoryManager().MMap(t, opts)
-	if err == nil && !anon && private && opts.Mappable != nil && opts.MappingIdentity != nil {
+	if file != nil && private && opts.Mappable != nil && opts.MappingIdentity != nil {
 		if mapper, ok := t.MemoryManager().AddressSpace().(platform.AddressSpacePrivateFileMapper); ok {
-			// Publishing is an optional optimization. The Guest VMA has
-			// already succeeded and remains the fallback if Host HEMI cannot
-			// accept the same mapping.
-			if err := mapper.PublishPrivateFileMapping(
-				t, rv, opts.Length, uint64(prot), uint64(flags), fd,
-				opts.Offset, opts.Mappable, opts.MappingIdentity); err != nil {
-				t.Debugf("HEMI private file mapping was not published: %v", err)
+			stat, statErr := file.Stat(t, vfs.StatOptions{Mask: linux.STATX_TYPE})
+			if statErr != nil || stat.Mask&linux.STATX_TYPE == 0 ||
+				uint32(stat.Mode)&linux.S_IFMT != linux.S_IFREG {
+				goto guestMMap
+			}
+			addr, handled, err := mapper.MapPrivateFile(
+				t, opts.Addr, opts.Length, uint64(prot), uint64(flags), fd,
+				opts.Offset, &privateFileProvider{file: file})
+			if handled || err != nil {
+				return uintptr(addr), nil, err
 			}
 		}
 	}
+guestMMap:
+	rv, err := t.MemoryManager().MMap(t, opts)
 	return uintptr(rv), nil, err
 }
 

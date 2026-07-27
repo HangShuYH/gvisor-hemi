@@ -410,31 +410,29 @@ type AddressSpaceInitializer interface {
 	InitializeAddressSpace() error
 }
 
-// AddressSpacePrivateFileMapper is implemented by AddressSpaces that can
-// publish an already-created private file VMA to a host-managed address space.
-// The Guest VMA remains authoritative unless the implementation accepts the
-// exact address returned by MemoryManager.MMap.
+// AddressSpacePrivateFileMapper is implemented by AddressSpaces that can make
+// the platform the sole owner of a private file mapping. The caller performs
+// Guest file and permission checks, but must not create a MemoryManager VMA
+// when handled is true.
 type AddressSpacePrivateFileMapper interface {
-	PublishPrivateFileMapping(ctx context.Context, addr hostarch.Addr, length, prot, flags uint64, guestFD int32, offset uint64, mappable memmap.Mappable, identity memmap.MappingIdentity) error
+	MapPrivateFile(ctx context.Context, addr hostarch.Addr, length, prot, flags uint64, guestFD int32, offset uint64, file PrivateFileProvider) (mappedAddr hostarch.Addr, handled bool, err error)
+}
+
+// PrivateFileProvider is the file-system half of a platform-owned private file
+// mapping. It provides file contents and lifetime only; it does not represent a
+// MemoryManager VMA.
+type PrivateFileProvider interface {
+	IncRef()
+	DecRef(ctx context.Context)
+	ReadAt(ctx context.Context, dst []byte, offset uint64) (int, error)
 }
 
 // AddressSpaceFilePager is implemented by AddressSpaces that delegate
-// file-backed page faults to the Sentry. MemoryManager calls ResolveFileFault
-// while holding its mapping lock for reading, which synchronizes Translate
-// with mapping invalidation.
+// platform-owned file-backed page faults to the Sentry.
 type AddressSpaceFilePager interface {
-	// ResolveFileFault resolves a Host-requested file fault at addr. mappable
-	// and faultMR identify the faulting page; optionalMR is the contiguous
-	// range in the same VMA that may be resolved speculatively. It returns
-	// false when the fault must follow the normal MemoryManager path.
-	//
-	// Preconditions:
-	//   - faultMR and optionalMR are page-aligned.
-	//   - faultMR.Length() == hostarch.PageSize.
-	//   - optionalMR.IsSupersetOf(faultMR).
-	//   - the caller synchronizes mappable.Translate with invalidation.
-	ResolveFileFault(ctx context.Context, addr hostarch.Addr, at hostarch.AccessType,
-		mappable memmap.Mappable, faultMR, optionalMR memmap.MappableRange) (bool, error)
+	// ResolveFileFault resolves a Host-requested file fault at addr. It returns
+	// false when the fault does not belong to a platform-owned file mapping.
+	ResolveFileFault(ctx context.Context, addr hostarch.Addr, at hostarch.AccessType) (bool, error)
 }
 
 // AddressSpaceIO supports IO through the memory mappings installed in an

@@ -17,6 +17,7 @@ package systrap
 import (
 	"bytes"
 	"errors"
+	"io"
 	"math"
 	"sync/atomic"
 	"testing"
@@ -27,78 +28,31 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/safemem"
-	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 )
 
 type hemiGvisorTestMapping struct {
-	memmap.MappableNoTrackMappings
-}
-
-func (*hemiGvisorTestMapping) Translate(context.Context, memmap.MappableRange, memmap.MappableRange, hostarch.AccessType) ([]memmap.Translation, error) {
-	return nil, errors.New("unused")
-}
-
-type hemiGvisorTestIdentity struct {
-	refs int
-}
-
-func (i *hemiGvisorTestIdentity) IncRef() {
-	i.refs++
-}
-
-func (i *hemiGvisorTestIdentity) DecRef(context.Context) {
-	i.refs--
-}
-
-func (*hemiGvisorTestIdentity) MappedName(context.Context) string {
-	return "hemi-test"
-}
-
-func (*hemiGvisorTestIdentity) DeviceID() uint64 {
-	return 1
-}
-
-func (*hemiGvisorTestIdentity) InodeID() uint64 {
-	return 2
-}
-
-func (*hemiGvisorTestIdentity) Msync(context.Context, memmap.MappableRange) error {
-	return nil
-}
-
-type hemiGvisorTestFile struct {
-	memmap.DefaultMemoryType
 	refs int
 	data [hostarch.PageSize]byte
 }
 
-func (f *hemiGvisorTestFile) IncRef(memmap.FileRange, uint32) {
-	f.refs++
+func (i *hemiGvisorTestMapping) IncRef() {
+	i.refs++
 }
 
-func (f *hemiGvisorTestFile) DecRef(memmap.FileRange) {
-	f.refs--
+func (i *hemiGvisorTestMapping) DecRef(context.Context) {
+	i.refs--
 }
 
-func (*hemiGvisorTestFile) MapInternal(memmap.FileRange, hostarch.AccessType) (safemem.BlockSeq, error) {
-	return safemem.BlockSeq{}, memmap.BufferedIOFallbackErr{}
-}
-
-func (f *hemiGvisorTestFile) BufferReadAt(off uint64, dst []byte) (uint64, error) {
-	return uint64(copy(dst, f.data[off:])), nil
-}
-
-func (*hemiGvisorTestFile) BufferWriteAt(uint64, []byte) (uint64, error) {
-	return 0, errors.New("unused")
-}
-
-func (*hemiGvisorTestFile) DataFD(memmap.FileRange) (int, error) {
-	return -1, errors.New("unused")
-}
-
-func (*hemiGvisorTestFile) FD() int {
-	return -1
+func (i *hemiGvisorTestMapping) ReadAt(_ context.Context, dst []byte, off uint64) (int, error) {
+	if off >= uint64(len(i.data)) {
+		return 0, io.EOF
+	}
+	n := copy(dst, i.data[off:])
+	if n != len(dst) {
+		return n, io.EOF
+	}
+	return n, nil
 }
 
 func TestHemiGvisorAllocateMMID(t *testing.T) {
@@ -121,18 +75,18 @@ func TestHemiGvisorAllocateMMID(t *testing.T) {
 
 func TestHemiGvisorFileTokenOwnership(t *testing.T) {
 	ctx := context.Background()
-	identity := &hemiGvisorTestIdentity{}
+	provider := &hemiGvisorTestMapping{}
 	device := &hemiGvisorDeviceState{}
 
-	fileToken, inodeToken, err := device.registerFileTokens(&hemiGvisorTestMapping{}, identity)
+	fileToken, inodeToken, err := device.registerFileTokens(provider)
 	if err != nil {
 		t.Fatalf("registerFileTokens: %v", err)
 	}
 	if fileToken == 0 || inodeToken == 0 || fileToken == inodeToken {
 		t.Fatalf("registerFileTokens returned invalid tokens %d/%d", fileToken, inodeToken)
 	}
-	if got := identity.refs; got != 2 {
-		t.Fatalf("identity refs after register = %d, want 2", got)
+	if got := provider.refs; got != 2 {
+		t.Fatalf("provider refs after register = %d, want 2", got)
 	}
 	if got := len(device.tokens); got != 2 {
 		t.Fatalf("registry length after register = %d, want 2", got)
@@ -141,14 +95,14 @@ func TestHemiGvisorFileTokenOwnership(t *testing.T) {
 	if err := device.releaseToken(ctx, fileToken, linux.HEMI_USERSPACE_RELEASE_FILE, 1); err != nil {
 		t.Fatalf("release file token: %v", err)
 	}
-	if got := identity.refs; got != 1 {
-		t.Fatalf("identity refs after file release = %d, want 1", got)
+	if got := provider.refs; got != 1 {
+		t.Fatalf("provider refs after file release = %d, want 1", got)
 	}
 	if err := device.releaseToken(ctx, inodeToken, linux.HEMI_USERSPACE_RELEASE_INODE, 1); err != nil {
 		t.Fatalf("release inode token: %v", err)
 	}
-	if got := identity.refs; got != 0 {
-		t.Fatalf("identity refs after inode release = %d, want 0", got)
+	if got := provider.refs; got != 0 {
+		t.Fatalf("provider refs after inode release = %d, want 0", got)
 	}
 	if got := len(device.tokens); got != 0 {
 		t.Fatalf("registry length after release = %d, want 0", got)
@@ -160,7 +114,7 @@ func TestHemiGvisorFileTokenOwnership(t *testing.T) {
 
 func TestHemiGvisorDrainReleaseQueues(t *testing.T) {
 	ctx := context.Background()
-	identity := &hemiGvisorTestIdentity{}
+	provider := &hemiGvisorTestMapping{}
 	const queueCount = 2
 	mapping := make([]byte, queueCount*linux.HEMI_USERSPACE_RELEASE_QUEUE_STRIDE)
 	device := &hemiGvisorDeviceState{
@@ -169,8 +123,7 @@ func TestHemiGvisorDrainReleaseQueues(t *testing.T) {
 		releaseCount:   queueCount,
 		releaseStride:  linux.HEMI_USERSPACE_RELEASE_QUEUE_STRIDE,
 	}
-	fileToken, inodeToken, err := device.registerFileTokens(
-		&hemiGvisorTestMapping{}, identity)
+	fileToken, inodeToken, err := device.registerFileTokens(provider)
 	if err != nil {
 		t.Fatalf("registerFileTokens: %v", err)
 	}
@@ -196,8 +149,8 @@ func TestHemiGvisorDrainReleaseQueues(t *testing.T) {
 	if err := device.drainReleases(ctx); err != nil {
 		t.Fatalf("drainReleases: %v", err)
 	}
-	if got := identity.refs; got != 0 {
-		t.Fatalf("identity refs after drain = %d, want 0", got)
+	if got := provider.refs; got != 0 {
+		t.Fatalf("provider refs after drain = %d, want 0", got)
 	}
 	if got := len(device.tokens); got != 0 {
 		t.Fatalf("registry length after drain = %d, want 0", got)
@@ -214,33 +167,31 @@ func TestHemiGvisorDrainReleaseQueues(t *testing.T) {
 
 func TestHemiGvisorPageTokenOwnership(t *testing.T) {
 	ctx := context.Background()
-	file := &hemiGvisorTestFile{}
-	for i := range file.data {
-		file.data[i] = byte(i)
+	provider := &hemiGvisorTestMapping{}
+	for i := range provider.data {
+		provider.data[i] = byte(i)
 	}
 	device := &hemiGvisorDeviceState{tokens: make(map[uint64]hemiGvisorToken)}
-	translation := memmap.Translation{
-		Source: memmap.MappableRange{Start: 0, End: hostarch.PageSize},
-		File:   file,
-		Offset: 0,
-		Perms:  hostarch.Read,
-	}
 
-	page, err := device.prepareFilePage(ctx, translation, 0)
+	page, err := device.prepareFilePage(ctx, provider, 0)
 	if err != nil {
 		t.Fatalf("prepareFilePage: %v", err)
 	}
 	if page.PageToken == 0 || page.PageVA%uint64(hostarch.PageSize) != 0 {
 		t.Fatalf("prepareFilePage returned invalid token/VA: %+v", page)
 	}
-	if file.refs != 1 || len(device.tokens) != 1 {
-		t.Fatalf("page ownership after prepare = (refs:%d, tokens:%d), want (1, 1)", file.refs, len(device.tokens))
+	pageData := unsafe.Slice((*byte)(unsafe.Pointer(uintptr(page.PageVA))), hostarch.PageSize)
+	if !bytes.Equal(pageData, provider.data[:]) {
+		t.Fatal("prepareFilePage returned incorrect file contents")
+	}
+	if len(device.tokens) != 1 {
+		t.Fatalf("page tokens after prepare = %d, want 1", len(device.tokens))
 	}
 	if err := device.releaseToken(ctx, page.PageToken, linux.HEMI_USERSPACE_RELEASE_PAGE, 1); err != nil {
 		t.Fatalf("release page token: %v", err)
 	}
-	if file.refs != 0 || len(device.tokens) != 0 {
-		t.Fatalf("page ownership after release = (refs:%d, tokens:%d), want (0, 0)", file.refs, len(device.tokens))
+	if len(device.tokens) != 0 {
+		t.Fatalf("page tokens after release = %d, want 0", len(device.tokens))
 	}
 }
 
