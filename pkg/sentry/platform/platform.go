@@ -418,13 +418,25 @@ type AddressSpacePrivateFileMapper interface {
 	MapPrivateFile(ctx context.Context, addr hostarch.Addr, length, prot, flags uint64, guestFD int32, offset uint64, file PrivateFileProvider) (mappedAddr hostarch.Addr, handled bool, err error)
 }
 
+// PrivateFileIdentity identifies a coherent file page cache.
+type PrivateFileIdentity struct {
+	DeviceID uint64
+	InodeID  uint64
+}
+
 // PrivateFileProvider is the file-system half of a platform-owned private file
-// mapping. It provides file contents and lifetime only; it does not represent a
-// MemoryManager VMA.
+// mapping. It registers a Mappable mapping without creating a MemoryManager
+// VMA, and translates Guest file offsets to referenced memmap.File ranges when
+// the platform requests file pages. Each Translation returned by Translate
+// owns one reference on Translation.FileRange(); the caller must release it
+// with Translation.File.DecRef, including when Translate also returns an error.
 type PrivateFileProvider interface {
 	IncRef()
 	DecRef(ctx context.Context)
-	ReadAt(ctx context.Context, dst []byte, offset uint64) (int, error)
+	InodeIdentity() PrivateFileIdentity
+	AddMapping(ctx context.Context, length, offset uint64) error
+	RemoveMapping(ctx context.Context)
+	Translate(ctx context.Context, required, optional memmap.MappableRange, at hostarch.AccessType) ([]memmap.Translation, error)
 }
 
 // AddressSpaceFilePager is implemented by AddressSpaces that delegate

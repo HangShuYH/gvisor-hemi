@@ -17,7 +17,6 @@ package systrap
 import (
 	"errors"
 	"fmt"
-	"io"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -101,6 +100,7 @@ type hemiGvisorDeviceState struct {
 	tokenMu   sync.Mutex
 	nextToken uint64
 	tokens    map[uint64]hemiGvisorToken
+	inodes    map[platform.PrivateFileIdentity]uint64
 
 	releaseMapping []byte
 	releaseCount   uint32
@@ -111,7 +111,7 @@ type hemiGvisorDeviceState struct {
 type hemiGvisorToken struct {
 	kind     uint32
 	provider platform.PrivateFileProvider
-	mapping  []byte
+	identity platform.PrivateFileIdentity
 	refs     uint64
 }
 
@@ -158,6 +158,7 @@ func hemiGvisorSetDeviceFD(deviceFile *fd.FD) {
 		file:           deviceFile,
 		fd:             deviceFD,
 		tokens:         make(map[uint64]hemiGvisorToken),
+		inodes:         make(map[platform.PrivateFileIdentity]uint64),
 		releaseMapping: releaseMapping,
 		releaseCount:   releaseSetup.QueueCount,
 		releaseStride:  releaseSetup.QueueStride,
@@ -1071,32 +1072,50 @@ func (d *hemiGvisorDeviceState) registerFileTokens(provider platform.PrivateFile
 	if provider == nil {
 		return 0, 0, fmt.Errorf("HEMI gVisor file token has no mapping provider")
 	}
+	identity := provider.InodeIdentity()
 	d.tokenMu.Lock()
 	defer d.tokenMu.Unlock()
-	if d.nextToken > ^uint64(0)-2 {
+	inodeToken, inodeExists := d.inodes[identity]
+	tokenCount := uint64(1)
+	if !inodeExists {
+		tokenCount++
+	}
+	if d.nextToken > ^uint64(0)-tokenCount {
 		return 0, 0, fmt.Errorf("HEMI gVisor token space exhausted")
 	}
 	fileToken := d.nextToken + 1
-	inodeToken := d.nextToken + 2
-	d.nextToken = inodeToken
+	d.nextToken = fileToken
 	if d.tokens == nil {
 		d.tokens = make(map[uint64]hemiGvisorToken)
 	}
+	if d.inodes == nil {
+		d.inodes = make(map[platform.PrivateFileIdentity]uint64)
+	}
 
-	// The registry owns one provider reference for each token. These
-	// references keep the file valid after the Guest descriptor is closed and
-	// are released only after the Host publishes a release record.
-	provider.IncRef()
+	// Each file token owns its mapping provider. A stable inode token is shared
+	// by mappings of the same file identity and owns one additional provider
+	// reference until the core releases its final inode reference.
 	provider.IncRef()
 	d.tokens[fileToken] = hemiGvisorToken{
 		kind:     linux.HEMI_USERSPACE_RELEASE_FILE,
 		provider: provider,
 		refs:     1,
 	}
-	d.tokens[inodeToken] = hemiGvisorToken{
-		kind:     linux.HEMI_USERSPACE_RELEASE_INODE,
-		provider: provider,
-		refs:     1,
+	if inodeExists {
+		entry := d.tokens[inodeToken]
+		entry.refs++
+		d.tokens[inodeToken] = entry
+	} else {
+		d.nextToken++
+		inodeToken = d.nextToken
+		provider.IncRef()
+		d.tokens[inodeToken] = hemiGvisorToken{
+			kind:     linux.HEMI_USERSPACE_RELEASE_INODE,
+			provider: provider,
+			identity: identity,
+			refs:     1,
+		}
+		d.inodes[identity] = inodeToken
 	}
 	return fileToken, inodeToken, nil
 }
@@ -1113,28 +1132,6 @@ func (d *hemiGvisorDeviceState) lookupFileToken(token uint64) (platform.PrivateF
 	return entry.provider, nil
 }
 
-// registerPageToken consumes mapping. The Host returns the token through the
-// shared release queues only after it has unpinned the pageVA supplied in
-// FILE_FAULT COMPLETE.
-func (d *hemiGvisorDeviceState) registerPageToken(mapping []byte) (uint64, error) {
-	d.tokenMu.Lock()
-	defer d.tokenMu.Unlock()
-	if d.nextToken == ^uint64(0) {
-		return 0, fmt.Errorf("HEMI gVisor token space exhausted")
-	}
-	if d.tokens == nil {
-		d.tokens = make(map[uint64]hemiGvisorToken)
-	}
-	d.nextToken++
-	token := d.nextToken
-	d.tokens[token] = hemiGvisorToken{
-		kind:    linux.HEMI_USERSPACE_RELEASE_PAGE,
-		mapping: mapping,
-		refs:    1,
-	}
-	return token, nil
-}
-
 func (d *hemiGvisorDeviceState) releaseToken(ctx context.Context, token uint64, kind uint32, count uint64) error {
 	if count == 0 {
 		return fmt.Errorf("HEMI gVisor release token %d has zero count", token)
@@ -1146,29 +1143,32 @@ func (d *hemiGvisorDeviceState) releaseToken(ctx context.Context, token uint64, 
 		return fmt.Errorf("HEMI gVisor release token %d has invalid kind/count %d/%d", token, kind, count)
 	}
 	entry.refs -= count
+	last := entry.refs == 0
 	if entry.refs == 0 {
 		delete(d.tokens, token)
+		if kind == linux.HEMI_USERSPACE_RELEASE_INODE {
+			delete(d.inodes, entry.identity)
+		}
 	} else {
 		d.tokens[token] = entry
 	}
 	d.tokenMu.Unlock()
 	switch kind {
-	case linux.HEMI_USERSPACE_RELEASE_PAGE:
-		if count != 1 || entry.mapping == nil {
-			return fmt.Errorf("HEMI gVisor page token %d has invalid ownership", token)
-		}
-		unmapErr := memutil.UnmapSlice(entry.mapping)
-		if errno, ok := unmapErr.(unix.Errno); ok && errno == 0 {
-			unmapErr = nil
-		}
-		if unmapErr != nil {
-			return fmt.Errorf("HEMI gVisor unmap page token %d: %w", token, unmapErr)
-		}
-	case linux.HEMI_USERSPACE_RELEASE_FILE, linux.HEMI_USERSPACE_RELEASE_INODE:
+	case linux.HEMI_USERSPACE_RELEASE_FILE:
 		if entry.provider == nil {
 			return fmt.Errorf("HEMI gVisor token %d has no provider", token)
 		}
+		if last {
+			entry.provider.RemoveMapping(ctx)
+		}
 		for range count {
+			entry.provider.DecRef(ctx)
+		}
+	case linux.HEMI_USERSPACE_RELEASE_INODE:
+		if entry.provider == nil {
+			return fmt.Errorf("HEMI gVisor inode token %d has no provider", token)
+		}
+		if last {
 			entry.provider.DecRef(ctx)
 		}
 	default:
@@ -1223,59 +1223,83 @@ func hemiGvisorPageFaultErrorCode(at hostarch.AccessType) uint64 {
 	return errorCode
 }
 
-func (d *hemiGvisorDeviceState) prepareFilePage(ctx context.Context, provider platform.PrivateFileProvider, offset uint64) (linux.HemiUserspaceFilePage, error) {
-	mapping, err := memutil.MapSlice(
-		0, uintptr(hostarch.PageSize), unix.PROT_READ|unix.PROT_WRITE,
-		unix.MAP_PRIVATE|unix.MAP_ANONYMOUS, ^uintptr(0), 0)
-	if err != nil {
-		return linux.HemiUserspaceFilePage{}, err
+type hemiGvisorFileRangeRef struct {
+	file memmap.File
+	fr   memmap.FileRange
+}
+
+func hemiGvisorReleaseFileRanges(refs []hemiGvisorFileRangeRef) {
+	for _, ref := range refs {
+		ref.file.DecRef(ref.fr)
 	}
-	cleanup := func() {
-		_ = memutil.UnmapSlice(mapping)
+}
+
+func hemiGvisorTranslateFilePages(ctx context.Context, provider platform.PrivateFileProvider, offset uint64, count uint32, at hostarch.AccessType) ([]linux.HemiUserspaceFilePage, []hemiGvisorFileRangeRef, error) {
+	end := offset + uint64(count)*uint64(hostarch.PageSize)
+	if end < offset {
+		return nil, nil, fmt.Errorf("HEMI gVisor file fault range overflows at offset %#x", offset)
 	}
 
-	nread := 0
-	for nread < len(mapping) {
-		n, readErr := provider.ReadAt(ctx, mapping[nread:], offset+uint64(nread))
-		if n < 0 || n > len(mapping)-nread {
-			cleanup()
-			return linux.HemiUserspaceFilePage{}, fmt.Errorf("HEMI gVisor invalid private-file read count %d", n)
+	// Private mappings always source data through a readable translation;
+	// HEMI performs the write-fault COW after importing the page-cache page.
+	perms := at
+	perms.Read = true
+	perms.Write = false
+	required := memmap.MappableRange{Start: offset, End: end}
+	optional := required
+	ts, translateErr := provider.Translate(ctx, required, optional, perms)
+
+	pages := make([]linux.HemiUserspaceFilePage, 0, count)
+	refs := make([]hemiGvisorFileRangeRef, 0, len(ts))
+	for _, t := range ts {
+		refs = append(refs, hemiGvisorFileRangeRef{
+			file: t.File,
+			fr:   t.FileRange(),
+		})
+	}
+	next := offset
+	for _, t := range ts {
+		if t.Source.End <= next {
+			continue
 		}
-		nread += n
-		if readErr != nil {
-			if errors.Is(readErr, io.EOF) {
-				break
-			}
-			cleanup()
-			return linux.HemiUserspaceFilePage{}, readErr
+		if t.Source.Start > next {
+			break
 		}
-		if n == 0 {
+		sourceEnd := min(t.Source.End, end)
+		hostOffset := t.Offset + next - t.Source.Start
+		fr := memmap.FileRange{
+			Start: hostOffset,
+			End:   hostOffset + sourceEnd - next,
+		}
+		fd, err := t.File.DataFD(fr)
+		if err != nil {
+			hemiGvisorReleaseFileRanges(refs)
+			return nil, nil, err
+		}
+		if fd < 0 || hostOffset%uint64(hostarch.PageSize) != 0 {
+			hemiGvisorReleaseFileRanges(refs)
+			return nil, nil, fmt.Errorf("HEMI gVisor translation returned fd=%d offset=%#x", fd, hostOffset)
+		}
+		for next < sourceEnd {
+			pages = append(pages, linux.HemiUserspaceFilePage{
+				HostFD:     int64(fd),
+				HostOffset: hostOffset,
+			})
+			next += uint64(hostarch.PageSize)
+			hostOffset += uint64(hostarch.PageSize)
+		}
+		if next == end {
 			break
 		}
 	}
-	if nread == 0 {
-		cleanup()
-		return linux.HemiUserspaceFilePage{}, &memmap.BusError{Err: io.EOF}
-	}
-
-	block := safemem.BlockFromSafeSlice(mapping)
-	token, err := d.registerPageToken(mapping)
-	if err != nil {
-		cleanup()
-		return linux.HemiUserspaceFilePage{}, err
-	}
-	return linux.HemiUserspaceFilePage{
-		PageToken: token,
-		PageVA:    uint64(block.Addr()),
-	}, nil
-}
-
-func (d *hemiGvisorDeviceState) rollbackPageTokens(ctx context.Context, pages []linux.HemiUserspaceFilePage) {
-	for _, page := range pages {
-		if err := d.releaseToken(ctx, page.PageToken, linux.HEMI_USERSPACE_RELEASE_PAGE, 1); err != nil {
-			log.Warningf("HEMI gVisor failed to roll back page token: %v", err)
+	if len(pages) == 0 {
+		hemiGvisorReleaseFileRanges(refs)
+		if translateErr != nil {
+			return nil, nil, translateErr
 		}
+		return nil, nil, fmt.Errorf("HEMI gVisor translation did not cover file offset %#x", offset)
 	}
+	return pages, refs, nil
 }
 
 // ResolveFileFault implements platform.AddressSpaceFilePager. HEMI owns the
@@ -1305,9 +1329,6 @@ func (s *subprocess) ResolveFileFault(ctx context.Context, addr hostarch.Addr, a
 	if errno != 0 {
 		return false, fmt.Errorf("HEMI gVisor file fault query ioctl: %w", errno)
 	}
-	if req.Result != 0 {
-		return false, fmt.Errorf("HEMI gVisor file fault query returned result %d", req.Result)
-	}
 	switch req.Action {
 	case linux.HEMI_USERSPACE_FILE_FAULT_HANDLED:
 		if req.NumPages != 0 {
@@ -1323,7 +1344,9 @@ func (s *subprocess) ResolveFileFault(ctx context.Context, addr hostarch.Addr, a
 	default:
 		return false, fmt.Errorf("HEMI gVisor file fault query returned unknown action %d", req.Action)
 	}
-	if req.NumPages == 0 || req.NumPages > linux.HEMI_USERSPACE_FILE_FAULT_MAX_PAGES {
+	if req.NumPages == 0 ||
+		req.NumPages > linux.HEMI_USERSPACE_FILE_FAULT_MAX_PAGES ||
+		req.Offset%uint64(hostarch.PageSize) != 0 {
 		return false, fmt.Errorf("HEMI gVisor file fault returned invalid range token=%d offset=%#x pages=%d",
 			req.FileToken, req.Offset, req.NumPages)
 	}
@@ -1334,27 +1357,15 @@ func (s *subprocess) ResolveFileFault(ctx context.Context, addr hostarch.Addr, a
 	}
 	defer provider.DecRef(ctx)
 
-	end := req.Offset + uint64(req.NumPages)*uint64(hostarch.PageSize)
-	if end < req.Offset {
-		return false, fmt.Errorf("HEMI gVisor file fault range overflows at offset %#x", req.Offset)
+	pages, refs, err := hemiGvisorTranslateFilePages(
+		ctx, provider, req.Offset, req.NumPages, at)
+	if err != nil {
+		return false, err
 	}
-
-	pages := make([]linux.HemiUserspaceFilePage, 0, req.NumPages)
-	for offset := req.Offset; offset < end; offset += uint64(hostarch.PageSize) {
-		page, err := device.prepareFilePage(ctx, provider, offset)
-		if err != nil {
-			if len(pages) == 0 {
-				return false, err
-			}
-			break
-		}
-		pages = append(pages, page)
-	}
-	if len(pages) == 0 {
-		return false, fmt.Errorf("HEMI gVisor file provider did not cover fault offset %#x", req.Offset)
-	}
+	defer hemiGvisorReleaseFileRanges(refs)
 
 	req.Phase = linux.HEMI_USERSPACE_FILE_FAULT_COMPLETE
+	req.PageSource = linux.HEMI_USERSPACE_FILE_PAGES_HOST_FD
 	req.NumPages = uint32(len(pages))
 	copy(req.Pages[:], pages)
 	errno = hostsyscall.RawSyscallErrno6(
@@ -1362,7 +1373,6 @@ func (s *subprocess) ResolveFileFault(ctx context.Context, addr hostarch.Addr, a
 		uintptr(unsafe.Pointer(&req)), 0, 0, 0)
 	runtime.KeepAlive(pages)
 	if errno != 0 {
-		device.rollbackPageTokens(ctx, pages)
 		switch errno {
 		case unix.EALREADY:
 			return true, nil
@@ -1373,12 +1383,8 @@ func (s *subprocess) ResolveFileFault(ctx context.Context, addr hostarch.Addr, a
 		}
 	}
 
-	// COMPLETE transfers every page token to the Host/core even when the
-	// resulting action falls back. The release goroutine owns them from here.
-	device.notifyReleaseDrain()
-	if req.Result != 0 {
-		return false, fmt.Errorf("HEMI gVisor file fault complete returned result %d", req.Result)
-	}
+	// COMPLETE synchronously acquires Host page-cache references. gVisor may
+	// drop its temporary memmap.File references when the ioctl returns.
 	switch req.Action {
 	case linux.HEMI_USERSPACE_FILE_FAULT_HANDLED:
 		return true, nil
@@ -1403,8 +1409,12 @@ func (s *subprocess) MapPrivateFile(ctx context.Context, addr hostarch.Addr, len
 	if device == nil || !s.hemiGvisorActive() {
 		return 0, false, nil
 	}
+	if err := provider.AddMapping(ctx, length, offset); err != nil {
+		return 0, true, err
+	}
 	fileToken, inodeToken, err := device.registerFileTokens(provider)
 	if err != nil {
+		provider.RemoveMapping(ctx)
 		return 0, true, err
 	}
 	req := linux.HemiUserspaceMapFile{

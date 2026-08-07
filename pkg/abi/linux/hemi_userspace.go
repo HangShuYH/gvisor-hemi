@@ -208,15 +208,18 @@ const (
 	HEMI_USERSPACE_FILE_FAULT_GUEST_HANDLE  = uint32(0)
 	HEMI_USERSPACE_FILE_FAULT_HANDLED       = uint32(1)
 	HEMI_USERSPACE_FILE_FAULT_GET_FILE_PAGE = uint32(2)
+
+	HEMI_USERSPACE_FILE_PAGES_GUEST   = uint32(0)
+	HEMI_USERSPACE_FILE_PAGES_HOST_FD = uint32(1)
 )
 
 // HemiUserspaceFilePage is struct hemi_userspace_file_page.
 //
 // +marshal
 type HemiUserspaceFilePage struct {
-	_         structs.HostLayout
-	PageToken uint64
-	PageVA    uint64
+	_          structs.HostLayout
+	HostFD     int64
+	HostOffset uint64
 }
 
 // HemiUserspaceFileFault is struct hemi_userspace_file_fault.
@@ -232,7 +235,7 @@ type HemiUserspaceFileFault struct {
 	NumPages       uint32
 	Phase          uint32
 	Action         uint32
-	Result         int32
+	PageSource     uint32
 	TargetTGID     int32
 	TargetDeviceFD int32
 	Pages          [HEMI_USERSPACE_FILE_FAULT_MAX_PAGES]HemiUserspaceFilePage

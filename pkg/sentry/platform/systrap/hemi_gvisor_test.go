@@ -15,9 +15,7 @@
 package systrap
 
 import (
-	"bytes"
 	"errors"
-	"io"
 	"math"
 	"sync/atomic"
 	"testing"
@@ -28,12 +26,16 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/safemem"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 )
 
 type hemiGvisorTestMapping struct {
-	refs int
-	data [hostarch.PageSize]byte
+	refs         int
+	mapped       bool
+	identity     platform.PrivateFileIdentity
+	translations []memmap.Translation
+	translateErr error
 }
 
 func (i *hemiGvisorTestMapping) IncRef() {
@@ -44,15 +46,54 @@ func (i *hemiGvisorTestMapping) DecRef(context.Context) {
 	i.refs--
 }
 
-func (i *hemiGvisorTestMapping) ReadAt(_ context.Context, dst []byte, off uint64) (int, error) {
-	if off >= uint64(len(i.data)) {
-		return 0, io.EOF
+func (i *hemiGvisorTestMapping) InodeIdentity() platform.PrivateFileIdentity {
+	return i.identity
+}
+
+func (i *hemiGvisorTestMapping) AddMapping(context.Context, uint64, uint64) error {
+	i.mapped = true
+	return nil
+}
+
+func (i *hemiGvisorTestMapping) RemoveMapping(context.Context) {
+	i.mapped = false
+}
+
+func (i *hemiGvisorTestMapping) Translate(ctx context.Context, required, optional memmap.MappableRange, at hostarch.AccessType) ([]memmap.Translation, error) {
+	if err := memmap.CheckTranslateResult(required, optional, at, i.translations, i.translateErr); err != nil {
+		return nil, err
 	}
-	n := copy(dst, i.data[off:])
-	if n != len(dst) {
-		return n, io.EOF
+	for _, t := range i.translations {
+		t.File.IncRef(t.FileRange(), 0)
 	}
-	return n, nil
+	return i.translations, i.translateErr
+}
+
+type hemiGvisorTestFile struct {
+	memmap.DefaultMemoryType
+	memmap.NoBufferedIOFallback
+	refs int
+	fd   int
+}
+
+func (f *hemiGvisorTestFile) IncRef(memmap.FileRange, uint32) {
+	f.refs++
+}
+
+func (f *hemiGvisorTestFile) DecRef(memmap.FileRange) {
+	f.refs--
+}
+
+func (f *hemiGvisorTestFile) MapInternal(memmap.FileRange, hostarch.AccessType) (safemem.BlockSeq, error) {
+	return safemem.BlockSeq{}, nil
+}
+
+func (f *hemiGvisorTestFile) DataFD(memmap.FileRange) (int, error) {
+	return f.fd, nil
+}
+
+func (f *hemiGvisorTestFile) FD() int {
+	return f.fd
 }
 
 func TestHemiGvisorAllocateMMID(t *testing.T) {
@@ -78,6 +119,9 @@ func TestHemiGvisorFileTokenOwnership(t *testing.T) {
 	provider := &hemiGvisorTestMapping{}
 	device := &hemiGvisorDeviceState{}
 
+	if err := provider.AddMapping(ctx, hostarch.PageSize, 0); err != nil {
+		t.Fatalf("AddMapping: %v", err)
+	}
 	fileToken, inodeToken, err := device.registerFileTokens(provider)
 	if err != nil {
 		t.Fatalf("registerFileTokens: %v", err)
@@ -98,6 +142,9 @@ func TestHemiGvisorFileTokenOwnership(t *testing.T) {
 	if got := provider.refs; got != 1 {
 		t.Fatalf("provider refs after file release = %d, want 1", got)
 	}
+	if provider.mapped {
+		t.Fatal("provider mapping remained after file release")
+	}
 	if err := device.releaseToken(ctx, inodeToken, linux.HEMI_USERSPACE_RELEASE_INODE, 1); err != nil {
 		t.Fatalf("release inode token: %v", err)
 	}
@@ -107,8 +154,55 @@ func TestHemiGvisorFileTokenOwnership(t *testing.T) {
 	if got := len(device.tokens); got != 0 {
 		t.Fatalf("registry length after release = %d, want 0", got)
 	}
+	if got := len(device.inodes); got != 0 {
+		t.Fatalf("inode registry length after release = %d, want 0", got)
+	}
 	if err := device.releaseToken(ctx, fileToken, linux.HEMI_USERSPACE_RELEASE_FILE, 1); err == nil {
 		t.Fatal("duplicate file release unexpectedly succeeded")
+	}
+}
+
+func TestHemiGvisorInodeTokenSharedByMappable(t *testing.T) {
+	ctx := context.Background()
+	identity := platform.PrivateFileIdentity{DeviceID: 12, InodeID: 34}
+	first := &hemiGvisorTestMapping{identity: identity}
+	second := &hemiGvisorTestMapping{identity: identity}
+	device := &hemiGvisorDeviceState{}
+	for _, provider := range []*hemiGvisorTestMapping{first, second} {
+		if err := provider.AddMapping(ctx, hostarch.PageSize, 0); err != nil {
+			t.Fatalf("AddMapping: %v", err)
+		}
+	}
+
+	firstFile, firstInode, err := device.registerFileTokens(first)
+	if err != nil {
+		t.Fatalf("register first file tokens: %v", err)
+	}
+	secondFile, secondInode, err := device.registerFileTokens(second)
+	if err != nil {
+		t.Fatalf("register second file tokens: %v", err)
+	}
+	if firstFile == secondFile {
+		t.Fatalf("file token %d was reused", firstFile)
+	}
+	if firstInode != secondInode {
+		t.Fatalf("inode tokens differ: %d and %d", firstInode, secondInode)
+	}
+
+	if err := device.releaseToken(ctx, firstFile, linux.HEMI_USERSPACE_RELEASE_FILE, 1); err != nil {
+		t.Fatalf("release first file token: %v", err)
+	}
+	if err := device.releaseToken(ctx, secondFile, linux.HEMI_USERSPACE_RELEASE_FILE, 1); err != nil {
+		t.Fatalf("release second file token: %v", err)
+	}
+	if err := device.releaseToken(ctx, firstInode, linux.HEMI_USERSPACE_RELEASE_INODE, 2); err != nil {
+		t.Fatalf("release shared inode token: %v", err)
+	}
+	if first.refs != 0 || second.refs != 0 {
+		t.Fatalf("provider refs after release = %d/%d, want 0/0", first.refs, second.refs)
+	}
+	if got := len(device.inodes); got != 0 {
+		t.Fatalf("inode registry length after release = %d, want 0", got)
 	}
 }
 
@@ -122,6 +216,9 @@ func TestHemiGvisorDrainReleaseQueues(t *testing.T) {
 		releaseMapping: mapping,
 		releaseCount:   queueCount,
 		releaseStride:  linux.HEMI_USERSPACE_RELEASE_QUEUE_STRIDE,
+	}
+	if err := provider.AddMapping(ctx, hostarch.PageSize, 0); err != nil {
+		t.Fatalf("AddMapping: %v", err)
 	}
 	fileToken, inodeToken, err := device.registerFileTokens(provider)
 	if err != nil {
@@ -165,33 +262,50 @@ func TestHemiGvisorDrainReleaseQueues(t *testing.T) {
 	}
 }
 
-func TestHemiGvisorPageTokenOwnership(t *testing.T) {
-	ctx := context.Background()
-	provider := &hemiGvisorTestMapping{}
-	for i := range provider.data {
-		provider.data[i] = byte(i)
+func TestHemiGvisorTranslateFilePages(t *testing.T) {
+	const (
+		guestOffset = uint64(0x2000)
+		hostOffset  = uint64(0x12000)
+		pageCount   = uint32(3)
+		hostFD      = 37
+	)
+	file := &hemiGvisorTestFile{fd: hostFD}
+	provider := &hemiGvisorTestMapping{
+		mapped: true,
+		translations: []memmap.Translation{{
+			Source: memmap.MappableRange{
+				Start: guestOffset,
+				End:   guestOffset + uint64(pageCount)*uint64(hostarch.PageSize),
+			},
+			File:   file,
+			Offset: hostOffset,
+			Perms:  hostarch.AnyAccess,
+		}},
 	}
-	device := &hemiGvisorDeviceState{tokens: make(map[uint64]hemiGvisorToken)}
-
-	page, err := device.prepareFilePage(ctx, provider, 0)
+	pages, refs, err := hemiGvisorTranslateFilePages(
+		context.Background(), provider, guestOffset, pageCount,
+		hostarch.AccessType{Write: true})
 	if err != nil {
-		t.Fatalf("prepareFilePage: %v", err)
+		t.Fatalf("hemiGvisorTranslateFilePages: %v", err)
 	}
-	if page.PageToken == 0 || page.PageVA%uint64(hostarch.PageSize) != 0 {
-		t.Fatalf("prepareFilePage returned invalid token/VA: %+v", page)
+	if got := len(pages); got != int(pageCount) {
+		t.Fatalf("translated pages = %d, want %d", got, pageCount)
 	}
-	pageData := unsafe.Slice((*byte)(unsafe.Pointer(uintptr(page.PageVA))), hostarch.PageSize)
-	if !bytes.Equal(pageData, provider.data[:]) {
-		t.Fatal("prepareFilePage returned incorrect file contents")
+	for i, page := range pages {
+		if page.HostFD != hostFD {
+			t.Errorf("page %d fd = %d, want %d", i, page.HostFD, hostFD)
+		}
+		wantOffset := hostOffset + uint64(i)*uint64(hostarch.PageSize)
+		if page.HostOffset != wantOffset {
+			t.Errorf("page %d offset = %#x, want %#x", i, page.HostOffset, wantOffset)
+		}
 	}
-	if len(device.tokens) != 1 {
-		t.Fatalf("page tokens after prepare = %d, want 1", len(device.tokens))
+	if file.refs != 1 {
+		t.Fatalf("translated file refs = %d, want 1", file.refs)
 	}
-	if err := device.releaseToken(ctx, page.PageToken, linux.HEMI_USERSPACE_RELEASE_PAGE, 1); err != nil {
-		t.Fatalf("release page token: %v", err)
-	}
-	if len(device.tokens) != 0 {
-		t.Fatalf("page tokens after release = %d, want 0", len(device.tokens))
+	hemiGvisorReleaseFileRanges(refs)
+	if file.refs != 0 {
+		t.Fatalf("file refs after release = %d, want 0", file.refs)
 	}
 }
 
@@ -361,6 +475,20 @@ func TestHemiGvisorRingABILayout(t *testing.T) {
 	}
 	if got, want := unsafe.Sizeof(linux.HemiUserspaceMapFile{}), uintptr(96); got != want {
 		t.Fatalf("sizeof(HemiUserspaceMapFile) = %d, want %d", got, want)
+	}
+	filePage := linux.HemiUserspaceFilePage{}
+	if got, want := unsafe.Sizeof(filePage), uintptr(16); got != want {
+		t.Fatalf("sizeof(HemiUserspaceFilePage) = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(filePage.HostOffset), uintptr(8); got != want {
+		t.Fatalf("offsetof(HemiUserspaceFilePage.HostOffset) = %d, want %d", got, want)
+	}
+	fileFault := linux.HemiUserspaceFileFault{}
+	if got, want := unsafe.Sizeof(fileFault), uintptr(320); got != want {
+		t.Fatalf("sizeof(HemiUserspaceFileFault) = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(fileFault.PageSource), uintptr(52); got != want {
+		t.Fatalf("offsetof(HemiUserspaceFileFault.PageSource) = %d, want %d", got, want)
 	}
 	releaseRing := linux.HemiUserspaceReleaseRing{}
 	if got, want := unsafe.Sizeof(releaseRing), uintptr(1664); got != want {

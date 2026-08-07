@@ -111,6 +111,7 @@ go_library(
         "//pkg/sentry/limits",
         "//pkg/sentry/memmap",
         "//pkg/sentry/mm",
+        "//pkg/sentry/pgalloc",
         "//pkg/sentry/platform",
         "//pkg/sentry/seccheck",
         "//pkg/sentry/seccheck/points:points_go_proto",

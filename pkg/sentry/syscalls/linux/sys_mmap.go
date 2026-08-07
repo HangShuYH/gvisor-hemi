@@ -16,6 +16,7 @@ package linux
 
 import (
 	"bytes"
+	"sync"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
@@ -26,29 +27,86 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
-	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 type privateFileProvider struct {
-	file *vfs.FileDescription
+	mu              sync.Mutex
+	mappingIdentity memmap.MappingIdentity
+	mappable        memmap.Mappable
+	identity        platform.PrivateFileIdentity
+	length          uint64
+	offset          uint64
+	mapped          bool
 }
 
 func (p *privateFileProvider) IncRef() {
-	p.file.IncRef()
+	p.mappingIdentity.IncRef()
 }
 
 func (p *privateFileProvider) DecRef(ctx context.Context) {
-	p.file.DecRef(ctx)
+	p.mappingIdentity.DecRef(ctx)
 }
 
-func (p *privateFileProvider) ReadAt(ctx context.Context, dst []byte, offset uint64) (int, error) {
-	if offset > uint64(^uint64(0)>>1) {
-		return 0, linuxerr.EOVERFLOW
+func (p *privateFileProvider) InodeIdentity() platform.PrivateFileIdentity {
+	return p.identity
+}
+
+func (p *privateFileProvider) AddMapping(ctx context.Context, length, offset uint64) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	ar := hostarch.AddrRange{End: hostarch.Addr(length)}
+	if err := p.mappable.AddMapping(ctx, p, ar, offset, false); err != nil {
+		return err
 	}
-	n, err := p.file.PRead(ctx, usermem.BytesIOSequence(dst), int64(offset), vfs.ReadOptions{})
-	return int(n), err
+	p.length = length
+	p.offset = offset
+	p.mapped = true
+	return nil
+}
+
+func (p *privateFileProvider) RemoveMapping(ctx context.Context) {
+	p.mu.Lock()
+	if !p.mapped {
+		p.mu.Unlock()
+		return
+	}
+	length := p.length
+	offset := p.offset
+	p.mapped = false
+	p.mu.Unlock()
+
+	// Do not hold p.mu while taking the Mappable's mapping lock:
+	// invalidation calls back into p.Invalidate while holding that lock.
+	p.mappable.RemoveMapping(ctx, p,
+		hostarch.AddrRange{End: hostarch.Addr(length)},
+		offset, false)
+}
+
+func (p *privateFileProvider) Translate(ctx context.Context, required, optional memmap.MappableRange, at hostarch.AccessType) ([]memmap.Translation, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.mapped {
+		return nil, linuxerr.EFAULT
+	}
+	ts, translateErr := p.mappable.Translate(ctx, required, optional, at)
+	if err := memmap.CheckTranslateResult(required, optional, at, ts, translateErr); err != nil {
+		return nil, err
+	}
+	memCgID := pgalloc.MemoryCgroupIDFromContext(ctx)
+	for _, t := range ts {
+		t.File.IncRef(t.FileRange(), memCgID)
+	}
+	return ts, translateErr
+}
+
+// Invalidate implements memmap.MappingSpace. The lock synchronizes invalidation
+// with Translate and the references it takes before returning.
+func (p *privateFileProvider) Invalidate(hostarch.AddrRange, memmap.InvalidateOpts) {
+	p.mu.Lock()
+	p.mu.Unlock()
 }
 
 // Brk implements linux syscall brk(2).
@@ -164,14 +222,26 @@ func Mmap(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *
 
 	if file != nil && private && opts.Mappable != nil && opts.MappingIdentity != nil {
 		if mapper, ok := t.MemoryManager().AddressSpace().(platform.AddressSpacePrivateFileMapper); ok {
-			stat, statErr := file.Stat(t, vfs.StatOptions{Mask: linux.STATX_TYPE})
-			if statErr != nil || stat.Mask&linux.STATX_TYPE == 0 ||
+			stat, statErr := file.Stat(t, vfs.StatOptions{
+				Mask: linux.STATX_TYPE | linux.STATX_INO,
+			})
+			if statErr != nil ||
+				stat.Mask&(linux.STATX_TYPE|linux.STATX_INO) !=
+					linux.STATX_TYPE|linux.STATX_INO ||
 				uint32(stat.Mode)&linux.S_IFMT != linux.S_IFREG {
 				goto guestMMap
 			}
 			addr, handled, err := mapper.MapPrivateFile(
 				t, opts.Addr, opts.Length, uint64(prot), uint64(flags), fd,
-				opts.Offset, &privateFileProvider{file: file})
+				opts.Offset, &privateFileProvider{
+					mappingIdentity: opts.MappingIdentity,
+					mappable:        opts.Mappable,
+					identity: platform.PrivateFileIdentity{
+						DeviceID: uint64(linux.MakeDeviceID(
+							uint16(stat.DevMajor), stat.DevMinor)),
+						InodeID: stat.Ino,
+					},
+				})
 			if handled || err != nil {
 				return uintptr(addr), nil, err
 			}
