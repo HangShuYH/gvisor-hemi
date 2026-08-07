@@ -162,6 +162,10 @@ type subprocess struct {
 	syscallThreadMu sync.Mutex
 	syscallThread   *syscallThread
 
+	// The HEMI binding below is initialized before the AddressSpace is exposed
+	// and cleared only after its final user has quiesced AddressSpaceIO. Fork
+	// protects the parent with PreFork and has not exposed the child, so these
+	// lifecycle-owned fields require no additional lock.
 	// hemiGvisorTGID identifies the Host subprocess prepared for this
 	// AddressSpace. It is cleared before the subprocess returns to the pool.
 	hemiGvisorTGID int32
@@ -169,10 +173,6 @@ type subprocess struct {
 	// A successful FREE_MM clears it before normal pool reuse; an unexpected
 	// FREE_MM failure retains it so the next acquire rejects this subprocess.
 	hemiGvisorMMID uint64
-	// hemiGvisorPortalMu serializes HEMI address-space lifecycle operations
-	// with user-memory, probe, and atomic operations, ensuring that a
-	// pooled address space can't be reset while a portal request is in flight.
-	hemiGvisorPortalMu sync.Mutex
 	// hemiGvisorDevice is the device instance controlling the current
 	// AddressSpace lifetime, or a failed FREE_MM retry.
 	hemiGvisorDevice *hemiGvisorDeviceState

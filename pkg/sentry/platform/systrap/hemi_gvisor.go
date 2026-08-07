@@ -399,8 +399,6 @@ func (s *subprocess) hemiGvisorPrepareAddressSpace() error {
 		return fmt.Errorf("HEMI gVisor subprocess has no host thread")
 	}
 
-	s.hemiGvisorPortalMu.Lock()
-	defer s.hemiGvisorPortalMu.Unlock()
 	if s.hemiGvisorMMID != 0 {
 		return fmt.Errorf("HEMI gVisor pooled subprocess still has active MMID %d",
 			s.hemiGvisorMMID)
@@ -413,18 +411,14 @@ func (s *subprocess) hemiGvisorPrepareAddressSpace() error {
 // InitializeAddressSpace implements platform.AddressSpaceInitializer for a new,
 // empty guest address space.
 func (s *subprocess) InitializeAddressSpace() error {
-	s.hemiGvisorPortalMu.Lock()
-	defer s.hemiGvisorPortalMu.Unlock()
 	if s.hemiGvisorDevice == nil {
 		return nil
 	}
-	return s.hemiGvisorAllocMMLocked()
+	return s.hemiGvisorAllocMM()
 }
 
 func (s *subprocess) hemiGvisorReleaseAddressSpace() {
-	s.hemiGvisorPortalMu.Lock()
-	defer s.hemiGvisorPortalMu.Unlock()
-	if err := s.hemiGvisorFreeMMLocked(); err != nil {
+	if err := s.hemiGvisorFreeMM(); err != nil {
 		log.Warningf("HEMI gVisor failed to free AddressSpace: %v", err)
 		// Keep the target identity and MMID so that a pooled subprocess
 		// cannot be mistaken for an empty AddressSpace. A subsequent acquire
@@ -441,10 +435,8 @@ func (s *subprocess) hemiGvisorDestroyAddressSpace() {
 	s.hemiGvisorReleaseAddressSpace()
 }
 
-// hemiGvisorAllocMMLocked creates an empty Host-managed address-space state.
-//
-// Preconditions: s.hemiGvisorPortalMu is locked.
-func (s *subprocess) hemiGvisorAllocMMLocked() error {
+// hemiGvisorAllocMM creates an empty Host-managed address-space state.
+func (s *subprocess) hemiGvisorAllocMM() error {
 	device := s.hemiGvisorDevice
 	if device == nil {
 		return nil
@@ -474,12 +466,10 @@ func (s *subprocess) hemiGvisorAllocMMLocked() error {
 	return nil
 }
 
-// hemiGvisorFreeMMLocked revokes portals and releases all Host state for the
+// hemiGvisorFreeMM revokes portals and releases all Host state for the
 // current AddressSpace. Its caller has already quiesced use of this AddressSpace;
 // the Host adaptor relies on that invariant and FREE_MM is idempotent.
-//
-// Preconditions: s.hemiGvisorPortalMu is locked.
-func (s *subprocess) hemiGvisorFreeMMLocked() error {
+func (s *subprocess) hemiGvisorFreeMM() error {
 	device := s.hemiGvisorDevice
 	mmid := s.hemiGvisorMMID
 	if mmid == 0 {
@@ -507,9 +497,6 @@ func (s *subprocess) ForkAddressSpaceFrom(source platform.AddressSpace) error {
 	if !ok {
 		return fmt.Errorf("HEMI gVisor fork source has type %T", source)
 	}
-	unlock := hemiGvisorLockForkPortals(parent, s)
-	defer unlock()
-
 	if parent.hemiGvisorDevice == nil && s.hemiGvisorDevice == nil {
 		return nil
 	}
@@ -540,25 +527,6 @@ func (s *subprocess) ForkAddressSpaceFrom(source platform.AddressSpace) error {
 	}
 	s.hemiGvisorMMID = childMMID
 	return nil
-}
-
-func hemiGvisorLockForkPortals(parent, child *subprocess) func() {
-	if parent == child {
-		parent.hemiGvisorPortalMu.Lock()
-		return parent.hemiGvisorPortalMu.Unlock
-	}
-	first, second := parent, child
-	if first.hemiGvisorMMID > second.hemiGvisorMMID ||
-		(first.hemiGvisorMMID == second.hemiGvisorMMID &&
-			uintptr(unsafe.Pointer(first)) > uintptr(unsafe.Pointer(second))) {
-		first, second = second, first
-	}
-	first.hemiGvisorPortalMu.Lock()
-	second.hemiGvisorPortalMu.Lock()
-	return func() {
-		second.hemiGvisorPortalMu.Unlock()
-		first.hemiGvisorPortalMu.Unlock()
-	}
 }
 
 // hemiGvisorKeepSyscallUnpatched reports whether sysno must continue entering
@@ -682,8 +650,6 @@ func (s *subprocess) AddressSpaceIOReadIgnoresPermissions() bool {
 // space has a usable ring. Legacy AddressSpaceIO retains MemoryManager's
 // smaller default buffer.
 func (s *subprocess) AddressSpaceIOBatchSize() int {
-	s.hemiGvisorPortalMu.Lock()
-	defer s.hemiGvisorPortalMu.Unlock()
 	if s.hemiGvisorActive() && s.hemiGvisorDevice != nil && s.hemiGvisorDevice.lanes != nil {
 		return hemiGvisorRingBatchBytes
 	}
@@ -709,8 +675,6 @@ func (s *subprocess) hemiGvisorAcquireRingLane(ars hostarch.AddrRangeSeq) (*hemi
 		return nil, nil, 0, platform.AddressSpaceIOUnavailable{}
 	}
 
-	s.hemiGvisorPortalMu.Lock()
-	defer s.hemiGvisorPortalMu.Unlock()
 	device := s.hemiGvisorDevice
 	if device == nil || device.lanes == nil || !s.hemiGvisorActive() {
 		return nil, nil, 0, platform.AddressSpaceIOUnavailable{}
@@ -724,8 +688,6 @@ func (s *subprocess) hemiGvisorAcquireRingLane(ars hostarch.AddrRangeSeq) (*hemi
 }
 
 func (s *subprocess) hemiGvisorTransferRingInPlace(device *hemiGvisorDeviceState, lane *hemiGvisorRingLane, mmid uint64, addr hostarch.Addr, data []byte, op uint16, enterFn hemiGvisorRingEnterFunc) (int, error) {
-	s.hemiGvisorPortalMu.Lock()
-	defer s.hemiGvisorPortalMu.Unlock()
 	if !s.hemiGvisorActive() || s.hemiGvisorDevice != device || s.hemiGvisorMMID != mmid {
 		return 0, &platform.AddressSpaceIOStreamError{Err: fmt.Errorf("HEMI gVisor address space changed during ring transfer")}
 	}
@@ -876,8 +838,6 @@ func (s *subprocess) EnsureAccess(addr hostarch.Addr, length uint64, at hostarch
 	if !hemiGvisorContainsUserMem(addr, length) {
 		return 0, platform.AddressSpaceIOUnavailable{}
 	}
-	s.hemiGvisorPortalMu.Lock()
-	defer s.hemiGvisorPortalMu.Unlock()
 	device := s.hemiGvisorDevice
 	if device == nil || !s.hemiGvisorActive() {
 		return 0, platform.AddressSpaceIOUnavailable{}
@@ -933,15 +893,11 @@ func (s *subprocess) CopyIn(addr hostarch.Addr, dst []byte) (int, error) {
 	if len(dst) == 0 {
 		return 0, nil
 	}
-	s.hemiGvisorPortalMu.Lock()
-	defer s.hemiGvisorPortalMu.Unlock()
-	return s.hemiGvisorCopyInLocked(addr, dst)
+	return s.hemiGvisorCopyIn(addr, dst)
 }
 
-// hemiGvisorCopyInLocked copies target memory into dst.
-//
-// Preconditions: s.hemiGvisorPortalMu is locked.
-func (s *subprocess) hemiGvisorCopyInLocked(addr hostarch.Addr, dst []byte) (int, error) {
+// hemiGvisorCopyIn copies target memory into dst.
+func (s *subprocess) hemiGvisorCopyIn(addr hostarch.Addr, dst []byte) (int, error) {
 	var done int
 	if device := s.hemiGvisorDevice; device != nil && s.hemiGvisorActive() {
 		if n, err, ok := device.tryRingTransfer(
@@ -971,15 +927,11 @@ func (s *subprocess) CopyOut(addr hostarch.Addr, src []byte) (int, error) {
 	if len(src) == 0 {
 		return 0, nil
 	}
-	s.hemiGvisorPortalMu.Lock()
-	defer s.hemiGvisorPortalMu.Unlock()
-	return s.hemiGvisorCopyOutLocked(addr, src)
+	return s.hemiGvisorCopyOut(addr, src)
 }
 
-// hemiGvisorCopyOutLocked copies src into target memory.
-//
-// Preconditions: s.hemiGvisorPortalMu is locked.
-func (s *subprocess) hemiGvisorCopyOutLocked(addr hostarch.Addr, src []byte) (int, error) {
+// hemiGvisorCopyOut copies src into target memory.
+func (s *subprocess) hemiGvisorCopyOut(addr hostarch.Addr, src []byte) (int, error) {
 	var done int
 	if device := s.hemiGvisorDevice; device != nil && s.hemiGvisorActive() {
 		if n, err, ok := device.tryRingTransfer(
@@ -1009,12 +961,10 @@ func (s *subprocess) ZeroOut(addr hostarch.Addr, toZero uintptr) (uintptr, error
 	if toZero == 0 {
 		return 0, nil
 	}
-	s.hemiGvisorPortalMu.Lock()
-	defer s.hemiGvisorPortalMu.Unlock()
 	var done uintptr
 	for done < toZero {
 		length := min(toZero-done, uintptr(len(hemiGvisorZeroBuffer)))
-		n, err := s.hemiGvisorCopyOutLocked(addr+hostarch.Addr(done), hemiGvisorZeroBuffer[:length])
+		n, err := s.hemiGvisorCopyOut(addr+hostarch.Addr(done), hemiGvisorZeroBuffer[:length])
 		done += uintptr(n)
 		if err != nil {
 			return done, err
@@ -1039,8 +989,6 @@ func (s *subprocess) hemiGvisorAtomicUint32(addr hostarch.Addr, op, old, new uin
 	if !hemiGvisorContainsUserMem(addr, 4) {
 		return 0, platform.AddressSpaceIOUnavailable{}
 	}
-	s.hemiGvisorPortalMu.Lock()
-	defer s.hemiGvisorPortalMu.Unlock()
 	device := s.hemiGvisorDevice
 	if device == nil || !s.hemiGvisorActive() {
 		return 0, platform.AddressSpaceIOUnavailable{}
@@ -1308,8 +1256,6 @@ func (s *subprocess) ResolveFileFault(ctx context.Context, addr hostarch.Addr, a
 	if !hemiGvisorContainsUserMem(addr, 1) {
 		return false, nil
 	}
-	s.hemiGvisorPortalMu.Lock()
-	defer s.hemiGvisorPortalMu.Unlock()
 	device := s.hemiGvisorDevice
 	if device == nil || !s.hemiGvisorActive() {
 		return false, nil
@@ -1403,8 +1349,6 @@ func (s *subprocess) MapPrivateFile(ctx context.Context, addr hostarch.Addr, len
 		return 0, false, nil
 	}
 
-	s.hemiGvisorPortalMu.Lock()
-	defer s.hemiGvisorPortalMu.Unlock()
 	device := s.hemiGvisorDevice
 	if device == nil || !s.hemiGvisorActive() {
 		return 0, false, nil
