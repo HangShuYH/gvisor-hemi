@@ -42,7 +42,7 @@ const hemiGvisorDevicePath = "/dev/hemi_userspace"
 const hemiGvisorUserMemMax = 16 * hostarch.PageSize
 
 const (
-	hemiGvisorRingLaneCount        = 4
+	hemiGvisorRingLaneCount        = 32
 	hemiGvisorRingEntries          = linux.HEMI_USERSPACE_RING_ENTRIES
 	hemiGvisorRingDescriptorOffset = linux.HEMI_USERSPACE_RING_DESCRIPTOR_OFFSET
 	hemiGvisorRingDescriptorSize   = linux.HEMI_USERSPACE_RING_DESCRIPTOR_SIZE
@@ -369,18 +369,17 @@ func hemiGvisorUseRing(length int) bool {
 	return length >= hemiGvisorRingMinBytes
 }
 
+// tryRingTransfer falls back only when the transfer is too small or ring setup
+// is unavailable. An eligible transfer waits for a lane instead of spilling
+// into the contended scalar portal when all lanes are temporarily busy.
 func (d *hemiGvisorDeviceState) tryRingTransfer(mmid uint64, addr hostarch.Addr, data []byte, op uint16) (int, error, bool) {
 	if d == nil || d.lanes == nil || !hemiGvisorUseRing(len(data)) {
 		return 0, nil, false
 	}
-	select {
-	case lane := <-d.lanes:
-		n, err := lane.transfer(d.fd, mmid, addr, data, op, hemiGvisorRawRingEnter)
-		d.lanes <- lane
-		return n, err, true
-	default:
-		return 0, nil, false
-	}
+	lane := <-d.lanes
+	n, err := lane.transfer(d.fd, mmid, addr, data, op, hemiGvisorRawRingEnter)
+	d.lanes <- lane
+	return n, err, true
 }
 
 // hemiGvisorPrepareAddressSpace records the unbound Host subprocess selected
@@ -667,9 +666,9 @@ func hemiGvisorContainsUserMemSeq(ars hostarch.AddrRangeSeq) bool {
 	return true
 }
 
-// hemiGvisorAcquireRingLane acquires a reusable shared bounce buffer without
-// invoking the stream. AddressSpaceIOUnavailable is therefore safe for
-// MemoryManager to handle by retrying through its generic buffered path.
+// hemiGvisorAcquireRingLane waits for a reusable shared bounce buffer without
+// invoking the stream. AddressSpaceIOUnavailable is returned only before the
+// stream is consumed, when the range or device cannot use the ring at all.
 func (s *subprocess) hemiGvisorAcquireRingLane(ars hostarch.AddrRangeSeq) (*hemiGvisorDeviceState, *hemiGvisorRingLane, uint64, error) {
 	if !hemiGvisorContainsUserMemSeq(ars) {
 		return nil, nil, 0, platform.AddressSpaceIOUnavailable{}
@@ -679,12 +678,8 @@ func (s *subprocess) hemiGvisorAcquireRingLane(ars hostarch.AddrRangeSeq) (*hemi
 	if device == nil || device.lanes == nil || !s.hemiGvisorActive() {
 		return nil, nil, 0, platform.AddressSpaceIOUnavailable{}
 	}
-	select {
-	case lane := <-device.lanes:
-		return device, lane, s.hemiGvisorMMID, nil
-	default:
-		return nil, nil, 0, platform.AddressSpaceIOUnavailable{}
-	}
+	lane := <-device.lanes
+	return device, lane, s.hemiGvisorMMID, nil
 }
 
 func (s *subprocess) hemiGvisorTransferRingInPlace(device *hemiGvisorDeviceState, lane *hemiGvisorRingLane, mmid uint64, addr hostarch.Addr, data []byte, op uint16, enterFn hemiGvisorRingEnterFunc) (int, error) {

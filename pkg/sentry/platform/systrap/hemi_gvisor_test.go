@@ -787,8 +787,9 @@ func TestHemiGvisorAddressSpaceIOIterUsesRingBuffer(t *testing.T) {
 	}
 }
 
-func TestHemiGvisorAddressSpaceIOIterUnavailableDoesNotConsumeStream(t *testing.T) {
-	device := &hemiGvisorDeviceState{lanes: make(chan *hemiGvisorRingLane)}
+func TestHemiGvisorAddressSpaceIOIterWaitsForRingLane(t *testing.T) {
+	lanes := make(chan *hemiGvisorRingLane)
+	device := &hemiGvisorDeviceState{lanes: lanes}
 	s := subprocess{
 		hemiGvisorDevice: device,
 		hemiGvisorTGID:   1,
@@ -798,13 +799,36 @@ func TestHemiGvisorAddressSpaceIOIterUnavailableDoesNotConsumeStream(t *testing.
 		Start: hostarch.Addr(linux.HEMI_USERSPACE_VMAR_START),
 		End:   hostarch.Addr(linux.HEMI_USERSPACE_VMAR_START + 1),
 	})
-	readerCalls := 0
-	_, err := s.CopyOutFromIter(ars, safemem.ReaderFunc(func(dsts safemem.BlockSeq) (uint64, error) {
-		readerCalls++
-		return 0, nil
-	}), nil)
-	if _, ok := err.(platform.AddressSpaceIOUnavailable); !ok || readerCalls != 0 {
-		t.Fatalf("unavailable stream = (%T(%v), Reader calls:%d), want (AddressSpaceIOUnavailable, 0)", err, err, readerCalls)
+	type result struct {
+		n   int64
+		err error
+	}
+	lane := newTestHemiGvisorRingLane()
+	resultCh := make(chan result, 1)
+	go func() {
+		n, err := s.copyOutFromIter(ars, safemem.ReaderFunc(func(dsts safemem.BlockSeq) (uint64, error) {
+			return safemem.ZeroSeq(dsts)
+		}), nil, func(_ int32, enter *linux.HemiUserspaceRingEnter) unix.Errno {
+			for i := 0; i < int(enter.Count); i++ {
+				lane.descriptor(i).Done = lane.descriptor(i).Len
+			}
+			return 0
+		})
+		resultCh <- result{n: n, err: err}
+	}()
+
+	select {
+	case lanes <- lane:
+	case got := <-resultCh:
+		t.Fatalf("stream returned before a ring lane was available: (%d, %v)", got.n, got.err)
+	}
+	returned := <-lanes
+	if returned != lane {
+		t.Fatalf("returned ring lane = %p, want %p", returned, lane)
+	}
+	got := <-resultCh
+	if got.n != 1 || got.err != nil {
+		t.Fatalf("stream after ring lane release = (%d, %v), want (1, nil)", got.n, got.err)
 	}
 }
 
