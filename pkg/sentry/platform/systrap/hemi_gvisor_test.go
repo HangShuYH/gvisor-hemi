@@ -18,8 +18,10 @@ import (
 	"bytes"
 	"errors"
 	"math"
+	"runtime"
 	"sync/atomic"
 	"testing"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -528,6 +530,35 @@ func newTestHemiGvisorRingLane() *hemiGvisorRingLane {
 	return &hemiGvisorRingLane{ringID: 17, mapping: mapping}
 }
 
+func newTestHemiGvisorRingPool(lanes ...*hemiGvisorRingLane) *hemiGvisorRingPool {
+	return newHemiGvisorRingPool(lanes)
+}
+
+func TestHemiGvisorRingPoolLeasesLanesIndependently(t *testing.T) {
+	lanes := make([]*hemiGvisorRingLane, 4)
+	for i := range lanes {
+		lanes[i] = newTestHemiGvisorRingLane()
+	}
+	pool := newHemiGvisorRingPool(lanes)
+	leased := make(map[*hemiGvisorRingLane]struct{}, len(lanes))
+	for range lanes {
+		lane := pool.tryAcquire(7, hostarch.Addr(linux.HEMI_USERSPACE_VMAR_START))
+		if lane == nil {
+			t.Fatal("ring pool ran out before every lane was leased")
+		}
+		if _, ok := leased[lane]; ok {
+			t.Fatalf("ring lane %p was leased twice", lane)
+		}
+		leased[lane] = struct{}{}
+	}
+	if lane := pool.tryAcquire(7, hostarch.Addr(linux.HEMI_USERSPACE_VMAR_START)); lane != nil {
+		t.Fatalf("fully leased ring pool returned lane %p", lane)
+	}
+	for lane := range leased {
+		pool.release(lane)
+	}
+}
+
 func TestHemiGvisorRingReadBatches(t *testing.T) {
 	lane := newTestHemiGvisorRingLane()
 	const (
@@ -711,8 +742,7 @@ func TestHemiGvisorRingEnterErrorIsReturned(t *testing.T) {
 
 func TestHemiGvisorAddressSpaceIOIterUsesRingBuffer(t *testing.T) {
 	lane := newTestHemiGvisorRingLane()
-	lanes := make(chan *hemiGvisorRingLane, 1)
-	lanes <- lane
+	ringPool := newTestHemiGvisorRingPool(lane)
 	const (
 		deviceFD = int32(3)
 		mmid     = uint64(5)
@@ -725,7 +755,7 @@ func TestHemiGvisorAddressSpaceIOIterUsesRingBuffer(t *testing.T) {
 	}
 
 	var ringWrite []byte
-	device := &hemiGvisorDeviceState{fd: deviceFD, lanes: lanes}
+	device := &hemiGvisorDeviceState{fd: deviceFD, ringPool: ringPool}
 	enterFn := func(gotFD int32, enter *linux.HemiUserspaceRingEnter) unix.Errno {
 		if gotFD != deviceFD || enter.MMID != mmid {
 			t.Fatalf("ENTER = (fd:%d, mmid:%d), want (%d, %d)", gotFD, enter.MMID, deviceFD, mmid)
@@ -789,8 +819,10 @@ func TestHemiGvisorAddressSpaceIOIterUsesRingBuffer(t *testing.T) {
 }
 
 func TestHemiGvisorAddressSpaceIOIterWaitsForRingLane(t *testing.T) {
-	lanes := make(chan *hemiGvisorRingLane)
-	device := &hemiGvisorDeviceState{lanes: lanes}
+	lane := newTestHemiGvisorRingLane()
+	ringPool := newTestHemiGvisorRingPool(lane)
+	held := ringPool.acquire(5, hostarch.Addr(linux.HEMI_USERSPACE_VMAR_START))
+	device := &hemiGvisorDeviceState{ringPool: ringPool}
 	s := subprocess{
 		hemiGvisorDevice: device,
 		hemiGvisorTGID:   1,
@@ -804,7 +836,6 @@ func TestHemiGvisorAddressSpaceIOIterWaitsForRingLane(t *testing.T) {
 		n   int64
 		err error
 	}
-	lane := newTestHemiGvisorRingLane()
 	resultCh := make(chan result, 1)
 	go func() {
 		n, err := s.copyOutFromIter(ars, safemem.ReaderFunc(func(dsts safemem.BlockSeq) (uint64, error) {
@@ -818,15 +849,19 @@ func TestHemiGvisorAddressSpaceIOIterWaitsForRingLane(t *testing.T) {
 		resultCh <- result{n: n, err: err}
 	}()
 
+	deadline := time.Now().Add(time.Second)
+	for ringPool.waiters.Load() == 0 && time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
+	if ringPool.waiters.Load() == 0 {
+		t.Fatal("stream did not wait for the busy ring lane")
+	}
 	select {
-	case lanes <- lane:
 	case got := <-resultCh:
 		t.Fatalf("stream returned before a ring lane was available: (%d, %v)", got.n, got.err)
+	default:
 	}
-	returned := <-lanes
-	if returned != lane {
-		t.Fatalf("returned ring lane = %p, want %p", returned, lane)
-	}
+	ringPool.release(held)
 	got := <-resultCh
 	if got.n != 1 || got.err != nil {
 		t.Fatalf("stream after ring lane release = (%d, %v), want (1, nil)", got.n, got.err)
@@ -835,14 +870,13 @@ func TestHemiGvisorAddressSpaceIOIterWaitsForRingLane(t *testing.T) {
 
 func TestHemiGvisorAddressSpaceIOIterRetriesFileFaultWithoutRereading(t *testing.T) {
 	lane := newTestHemiGvisorRingLane()
-	lanes := make(chan *hemiGvisorRingLane, 1)
-	lanes <- lane
+	ringPool := newTestHemiGvisorRingPool(lane)
 	const (
 		deviceFD = int32(3)
 		mmid     = uint64(5)
 		base     = hostarch.Addr(linux.HEMI_USERSPACE_VMAR_START)
 	)
-	device := &hemiGvisorDeviceState{fd: deviceFD, lanes: lanes}
+	device := &hemiGvisorDeviceState{fd: deviceFD, ringPool: ringPool}
 	s := subprocess{
 		hemiGvisorDevice: device,
 		hemiGvisorTGID:   1,
@@ -890,14 +924,13 @@ func TestHemiGvisorAddressSpaceIOIterRetriesFileFaultWithoutRereading(t *testing
 
 func TestHemiGvisorAddressSpaceIOIterRetriesInitialReadFileFault(t *testing.T) {
 	lane := newTestHemiGvisorRingLane()
-	lanes := make(chan *hemiGvisorRingLane, 1)
-	lanes <- lane
+	ringPool := newTestHemiGvisorRingPool(lane)
 	const (
 		deviceFD = int32(3)
 		mmid     = uint64(5)
 		base     = hostarch.Addr(linux.HEMI_USERSPACE_VMAR_START)
 	)
-	device := &hemiGvisorDeviceState{fd: deviceFD, lanes: lanes}
+	device := &hemiGvisorDeviceState{fd: deviceFD, ringPool: ringPool}
 	s := subprocess{
 		hemiGvisorDevice: device,
 		hemiGvisorTGID:   1,

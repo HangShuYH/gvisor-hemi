@@ -86,8 +86,19 @@ func (e *hemiGvisorRingEnterError) Unwrap() error {
 }
 
 type hemiGvisorRingLane struct {
+	leased  atomic.Uint32
+	_       [60]byte // Keep independently written lease words off shared cache lines.
 	ringID  uint64
 	mapping []byte
+}
+
+// hemiGvisorRingPool keeps the uncontended acquire/release path local to a
+// lane. The condition variable is used only when every lane is leased.
+type hemiGvisorRingPool struct {
+	lanes   []*hemiGvisorRingLane
+	waitMu  sync.Mutex
+	wait    *sync.Cond
+	waiters atomic.Int32
 }
 
 type hemiGvisorDeviceState struct {
@@ -96,7 +107,7 @@ type hemiGvisorDeviceState struct {
 
 	mmidMu   sync.Mutex
 	nextMMID uint64
-	lanes    chan *hemiGvisorRingLane
+	ringPool *hemiGvisorRingPool
 
 	tokenMu   sync.Mutex
 	nextToken uint64
@@ -165,7 +176,7 @@ func hemiGvisorSetDeviceFD(deviceFile *fd.FD) {
 		releaseStride:  releaseSetup.QueueStride,
 		releaseWake:    make(chan struct{}, 1),
 	}
-	state.lanes = hemiGvisorSetupRingLanes(state.fd)
+	state.ringPool = hemiGvisorSetupRingPool(state.fd)
 
 	hemiGvisorDevice.Lock()
 	hemiGvisorDevice.state = state
@@ -233,7 +244,7 @@ func hemiGvisorSetupReleaseQueues(deviceFD int32) ([]byte, linux.HemiUserspaceRe
 	return mapping, setup, nil
 }
 
-func hemiGvisorSetupRingLanes(deviceFD int32) chan *hemiGvisorRingLane {
+func hemiGvisorSetupRingPool(deviceFD int32) *hemiGvisorRingPool {
 	lanes := make([]*hemiGvisorRingLane, 0, hemiGvisorRingLaneCount)
 	for range hemiGvisorRingLaneCount {
 		lane, err := hemiGvisorSetupRingLane(deviceFD)
@@ -245,12 +256,65 @@ func hemiGvisorSetupRingLanes(deviceFD int32) chan *hemiGvisorRingLane {
 		}
 		lanes = append(lanes, lane)
 	}
+	return newHemiGvisorRingPool(lanes)
+}
 
-	available := make(chan *hemiGvisorRingLane, len(lanes))
-	for _, lane := range lanes {
-		available <- lane
+func newHemiGvisorRingPool(lanes []*hemiGvisorRingLane) *hemiGvisorRingPool {
+	if len(lanes) == 0 {
+		return nil
 	}
-	return available
+	pool := &hemiGvisorRingPool{lanes: lanes}
+	pool.wait = sync.NewCond(&pool.waitMu)
+	return pool
+}
+
+func hemiGvisorRingLaneStart(mmid uint64, addr hostarch.Addr, count int) int {
+	key := mmid ^ uint64(addr>>6)
+	key ^= key >> 33
+	key *= 0xff51afd7ed558ccd
+	key ^= key >> 33
+	return int(key % uint64(count))
+}
+
+func (p *hemiGvisorRingPool) tryAcquire(mmid uint64, addr hostarch.Addr) *hemiGvisorRingLane {
+	if p == nil || len(p.lanes) == 0 {
+		return nil
+	}
+	start := hemiGvisorRingLaneStart(mmid, addr, len(p.lanes))
+	for i := range p.lanes {
+		lane := p.lanes[(start+i)%len(p.lanes)]
+		if lane.leased.CompareAndSwap(0, 1) {
+			return lane
+		}
+	}
+	return nil
+}
+
+func (p *hemiGvisorRingPool) acquire(mmid uint64, addr hostarch.Addr) *hemiGvisorRingLane {
+	if lane := p.tryAcquire(mmid, addr); lane != nil {
+		return lane
+	}
+
+	p.waitMu.Lock()
+	p.waiters.Add(1)
+	for {
+		if lane := p.tryAcquire(mmid, addr); lane != nil {
+			p.waiters.Add(-1)
+			p.waitMu.Unlock()
+			return lane
+		}
+		p.wait.Wait()
+	}
+}
+
+func (p *hemiGvisorRingPool) release(lane *hemiGvisorRingLane) {
+	lane.leased.Store(0)
+	if p.waiters.Load() == 0 {
+		return
+	}
+	p.waitMu.Lock()
+	p.wait.Signal()
+	p.waitMu.Unlock()
 }
 
 func hemiGvisorSetupRingLane(deviceFD int32) (*hemiGvisorRingLane, error) {
@@ -374,12 +438,12 @@ func hemiGvisorUseRing(length int) bool {
 // is unavailable. An eligible transfer waits for a lane instead of spilling
 // into the contended scalar portal when all lanes are temporarily busy.
 func (d *hemiGvisorDeviceState) tryRingTransfer(mmid uint64, addr hostarch.Addr, data []byte, op uint16) (int, error, bool) {
-	if d == nil || d.lanes == nil || !hemiGvisorUseRing(len(data)) {
+	if d == nil || d.ringPool == nil || !hemiGvisorUseRing(len(data)) {
 		return 0, nil, false
 	}
-	lane := <-d.lanes
+	lane := d.ringPool.acquire(mmid, addr)
 	n, err := lane.transfer(d.fd, mmid, addr, data, op, hemiGvisorRawRingEnter)
-	d.lanes <- lane
+	d.ringPool.release(lane)
 	return n, err, true
 }
 
@@ -647,7 +711,7 @@ func (s *subprocess) AddressSpaceIOReadIgnoresPermissions() bool {
 // space has a usable ring. Legacy AddressSpaceIO retains MemoryManager's
 // smaller default buffer.
 func (s *subprocess) AddressSpaceIOBatchSize() int {
-	if s.hemiGvisorActive() && s.hemiGvisorDevice != nil && s.hemiGvisorDevice.lanes != nil {
+	if s.hemiGvisorActive() && s.hemiGvisorDevice != nil && s.hemiGvisorDevice.ringPool != nil {
 		return hemiGvisorRingBatchBytes
 	}
 	return 0
@@ -673,10 +737,17 @@ func (s *subprocess) hemiGvisorAcquireRingLane(ars hostarch.AddrRangeSeq) (*hemi
 	}
 
 	device := s.hemiGvisorDevice
-	if device == nil || device.lanes == nil || !s.hemiGvisorActive() {
+	if device == nil || device.ringPool == nil || !s.hemiGvisorActive() {
 		return nil, nil, 0, platform.AddressSpaceIOUnavailable{}
 	}
-	lane := <-device.lanes
+	addr := hostarch.Addr(0)
+	for remaining := ars; !remaining.IsEmpty(); remaining = remaining.Tail() {
+		if remaining.Head().Length() != 0 {
+			addr = remaining.Head().Start
+			break
+		}
+	}
+	lane := device.ringPool.acquire(s.hemiGvisorMMID, addr)
 	return device, lane, s.hemiGvisorMMID, nil
 }
 
@@ -711,7 +782,7 @@ func (s *subprocess) copyOutFromIter(ars hostarch.AddrRangeSeq, src safemem.Read
 	if err != nil {
 		return 0, err
 	}
-	defer func() { device.lanes <- lane }()
+	defer device.ringPool.release(lane)
 
 	buf := lane.mapping[hemiGvisorRingDataOffset : hemiGvisorRingDataOffset+hemiGvisorRingBatchBytes]
 	var done int64
@@ -770,7 +841,7 @@ func (s *subprocess) copyInToIter(ars hostarch.AddrRangeSeq, dst safemem.Writer,
 	if err != nil {
 		return 0, err
 	}
-	defer func() { device.lanes <- lane }()
+	defer device.ringPool.release(lane)
 
 	buf := lane.mapping[hemiGvisorRingDataOffset : hemiGvisorRingDataOffset+hemiGvisorRingBatchBytes]
 	var done int64
