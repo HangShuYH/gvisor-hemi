@@ -15,6 +15,7 @@
 package systrap
 
 import (
+	"bytes"
 	"errors"
 	"math"
 	"sync/atomic"

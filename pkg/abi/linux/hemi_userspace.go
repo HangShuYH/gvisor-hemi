@@ -59,9 +59,12 @@ var (
 )
 
 const (
-	HEMI_USERSPACE_ACCESS_READ    = uint32(1)
-	HEMI_USERSPACE_ACCESS_WRITE   = uint32(2)
-	HEMI_USERSPACE_ACCESS_NOFAULT = uint32(4)
+	HEMI_USERSPACE_ACCESS_READ               = uint32(1)
+	HEMI_USERSPACE_ACCESS_WRITE              = uint32(2)
+	HEMI_USERSPACE_ACCESS_NOFAULT            = uint32(4)
+	HEMI_USERSPACE_ACCESS_IGNORE_PERMISSIONS = uint32(8)
+
+	HEMI_USERSPACE_PF_IGNORE_PERMISSIONS = uint64(1) << 63
 )
 
 // HemiUserspaceAccess is struct hemi_userspace_access.

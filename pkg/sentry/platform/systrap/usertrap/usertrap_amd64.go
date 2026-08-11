@@ -59,9 +59,10 @@ type memoryManager interface {
 //
 // +stateify savable
 type State struct {
-	mu        sync.RWMutex `state:"nosave"`
-	nextTrap  uint32
-	tableAddr hostarch.Addr
+	mu               sync.RWMutex `state:"nosave"`
+	patchingDisabled bool         `state:"nosave"`
+	nextTrap         uint32
+	tableAddr        hostarch.Addr
 }
 
 // New returns the new state structure.
@@ -204,6 +205,9 @@ func (s *State) PatchSyscall(ctx context.Context, ac *arch.Context64, mm memoryM
 	//     process).
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.patchingDisabled {
+		return nil
+	}
 	if task.Tracer() != nil {
 		if s.nextTrap > 0 {
 			ctx.Warningf("LIKELY ERROR: Attached tracer to process with patched syscalls (traps %d)! Systrap is not fully compatible with ptrace/debuggers, program may die unexpectedly soon! Use `--systrap-disable-syscall-patching` as a workaround.", s.nextTrap)
@@ -226,8 +230,11 @@ func (s *State) PatchSyscall(ctx context.Context, ac *arch.Context64, mm memoryM
 
 		trapAddr, err := s.addTrapLocked(ctx, ac, mm, uint32(sysno))
 		if trapAddr == 0 || err != nil {
-			ctx.Warningf("Failed to add a new trap: %v", err)
-			return nil
+			s.patchingDisabled = true
+			if err == nil {
+				err = fmt.Errorf("trap allocator returned address 0")
+			}
+			return fmt.Errorf("failed to add a new trap: %w", err)
 		}
 
 		// Replace "mov sysno, %eax; syscall" with "jmp trapAddr".
@@ -238,6 +245,21 @@ func (s *State) PatchSyscall(ctx context.Context, ac *arch.Context64, mm memoryM
 		ctx.Debugf("Apply the binary patch addr %x trap addr %x (%v -> %v)", patchAddr, trapAddr, prevCode, newCode)
 
 		ignorePermContext := task.OwnCopyContext(usermem.IOOpts{IgnorePermissions: true})
+		restore := func(patchErr error) error {
+			s.patchingDisabled = true
+			// Keep the syscall byte invalid while restoring the surrounding
+			// instruction bytes, then publish the original syscall byte last.
+			if _, err := primitive.CopyUint8SliceOut(ignorePermContext, hostarch.Addr(patchAddr+1), prevCode[1:faultInstOffset]); err != nil {
+				return fmt.Errorf("patch failed: %v; restoring instruction prefix: %w", patchErr, err)
+			}
+			if _, err := primitive.CopyUint8SliceOut(ignorePermContext, hostarch.Addr(patchAddr+faultInstOffset+1), prevCode[faultInstOffset+1:]); err != nil {
+				return fmt.Errorf("patch failed: %v; restoring instruction suffix: %w", patchErr, err)
+			}
+			if _, err := primitive.CopyUint8SliceOut(ignorePermContext, hostarch.Addr(patchAddr+faultInstOffset), prevCode[faultInstOffset:faultInstOffset+1]); err != nil {
+				return fmt.Errorf("patch failed: %v; restoring syscall byte: %w", patchErr, err)
+			}
+			return patchErr
+		}
 
 		// The patch can't be applied atomically, so we need to
 		// guarantee that in each moment other threads will read a
@@ -271,19 +293,19 @@ func (s *State) PatchSyscall(ctx context.Context, ac *arch.Context64, mm memoryM
 		// the invalid instruction and restart a patched code.
 		faultInstB := primitive.ByteSlice(faultInst[:])
 		if _, err := faultInstB.CopyOut(ignorePermContext, hostarch.Addr(patchAddr+faultInstOffset)); err != nil {
-			return err
+			return restore(err)
 		}
 		// The second step is to replace all bytes except the first one
 		// which is the opcode of the mov instruction, so that the first
 		// five bytes remain "mov XXX, %rax".
 		if _, err := primitive.CopyUint8SliceOut(ignorePermContext, hostarch.Addr(patchAddr+1), newCode[1:]); err != nil {
-			return err
+			return restore(err)
 		}
 		// The final step is to replace the first byte of the patch.
 		// After this point, all threads will read the valid jmp
 		// instruction.
 		if _, err := primitive.CopyUint8SliceOut(ignorePermContext, hostarch.Addr(patchAddr), newCode[0:1]); err != nil {
-			return err
+			return restore(err)
 		}
 	}
 	return nil

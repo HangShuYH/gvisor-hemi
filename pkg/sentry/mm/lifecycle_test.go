@@ -42,18 +42,19 @@ func (p *forkTrackingPlatform) NewAddressSpace() (platform.AddressSpace, error) 
 
 type forkTrackingAddressSpace struct {
 	platform.AddressSpace
-	forkSource            platform.AddressSpace
-	ensureAddr            hostarch.Addr
-	ensureLength          uint64
-	ensureAccess          hostarch.AccessType
-	ignorePermissionsRead bool
-	copyInCalls           int
-	copyOutCalls          int
-	copyInData            []byte
-	atomicValue           uint32
-	swapUint32Calls       int
-	compareAndSwapCalls   int
-	loadUint32Calls       int
+	forkSource                      platform.AddressSpace
+	ensureAddr                      hostarch.Addr
+	ensureLength                    uint64
+	ensureAccess                    hostarch.AccessType
+	ignorePermissionsRead           bool
+	copyInCalls                     int
+	copyOutCalls                    int
+	copyOutIgnoringPermissionsCalls int
+	copyInData                      []byte
+	atomicValue                     uint32
+	swapUint32Calls                 int
+	compareAndSwapCalls             int
+	loadUint32Calls                 int
 }
 
 func (as *forkTrackingAddressSpace) ForkAddressSpaceFrom(source platform.AddressSpace) error {
@@ -79,6 +80,11 @@ func (as *forkTrackingAddressSpace) CopyIn(addr hostarch.Addr, dst []byte) (int,
 
 func (as *forkTrackingAddressSpace) CopyOut(addr hostarch.Addr, src []byte) (int, error) {
 	as.copyOutCalls++
+	return len(src), nil
+}
+
+func (as *forkTrackingAddressSpace) CopyOutIgnoringPermissions(addr hostarch.Addr, src []byte) (int, error) {
+	as.copyOutIgnoringPermissionsCalls++
 	return len(src), nil
 }
 
@@ -179,6 +185,32 @@ func TestCopyInIgnorePermissionsUsesCapableAddressSpace(t *testing.T) {
 	}
 	if got[0] != 0x0f || got[1] != 0xa2 {
 		t.Fatalf("CopyIn returned %x, want 0fa2", got)
+	}
+}
+
+func TestCopyOutIgnorePermissionsUsesCapableAddressSpace(t *testing.T) {
+	ctx := contexttest.Context(t)
+	p := &forkTrackingPlatform{Platform: platform.FromContext(ctx)}
+	mm, err := NewMemoryManager(p, pgalloc.MemoryFileFromContext(ctx))
+	if err != nil {
+		t.Fatalf("NewMemoryManager: %v", err)
+	}
+	defer mm.DecUsers(ctx)
+
+	mm.haveASIO = true
+	mm.layout.MaxAddr = p.MaxUserAddress()
+	as := p.addressSpaces[0]
+	data := []byte{0xff, 0x24, 0x25}
+	if n, err := mm.CopyOut(ctx, p.MinUserAddress(), data, usermem.IOOpts{IgnorePermissions: true}); err != nil {
+		t.Fatalf("CopyOut: %v", err)
+	} else if n != len(data) {
+		t.Fatalf("CopyOut copied %d bytes, want %d", n, len(data))
+	}
+	if as.copyOutIgnoringPermissionsCalls != 1 {
+		t.Fatalf("AddressSpace.CopyOutIgnoringPermissions called %d times, want 1", as.copyOutIgnoringPermissionsCalls)
+	}
+	if as.copyOutCalls != 0 {
+		t.Fatalf("AddressSpace.CopyOut called %d times, want 0", as.copyOutCalls)
 	}
 }
 

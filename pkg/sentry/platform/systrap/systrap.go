@@ -181,7 +181,9 @@ restart:
 		return nil, hostarch.NoAccess, err
 	}
 	if needPatch && !s.hemiGvisorKeepSyscallUnpatched(ac.SyscallNo()) {
-		s.usertrap.PatchSyscall(ctx, ac, mm)
+		if err := s.usertrap.PatchSyscall(ctx, ac, mm); err != nil {
+			ctx.Warningf("usertrap.PatchSyscall failed; disabling further patching for this address space: %v", err)
+		}
 	}
 	if !isSyscall && linux.Signal(c.signalInfo.Signo) == linux.SIGILL {
 		err := s.usertrap.HandleFault(ctx, ac, mm)

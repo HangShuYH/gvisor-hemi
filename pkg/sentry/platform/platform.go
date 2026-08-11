@@ -444,7 +444,9 @@ type PrivateFileProvider interface {
 type AddressSpaceFilePager interface {
 	// ResolveFileFault resolves a Host-requested file fault at addr. It returns
 	// false when the fault does not belong to a platform-owned file mapping.
-	ResolveFileFault(ctx context.Context, addr hostarch.Addr, at hostarch.AccessType) (bool, error)
+	// ignorePermissions is true only for a trusted kernel write that bypasses
+	// current application permissions while preserving COW semantics.
+	ResolveFileFault(ctx context.Context, addr hostarch.Addr, at hostarch.AccessType, ignorePermissions bool) (bool, error)
 }
 
 // AddressSpaceIO supports IO through the memory mappings installed in an
@@ -519,6 +521,13 @@ type AddressSpaceIORangeApplicability interface {
 // set.
 type AddressSpaceIOReadIgnoresPermissions interface {
 	AddressSpaceIOReadIgnoresPermissions() bool
+}
+
+// AddressSpaceIOWriteIgnoresPermissions is implemented by AddressSpaces that
+// can perform a privileged CopyOut while preserving application page-table
+// permissions and private-mapping COW semantics.
+type AddressSpaceIOWriteIgnoresPermissions interface {
+	CopyOutIgnoringPermissions(addr hostarch.Addr, src []byte) (int, error)
 }
 
 // AddressSpaceIOBatchSizer is implemented by AddressSpaces that can process

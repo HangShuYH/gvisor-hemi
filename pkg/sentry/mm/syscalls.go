@@ -36,7 +36,7 @@ import (
 func (mm *MemoryManager) HandleUserFault(ctx context.Context, addr hostarch.Addr, at hostarch.AccessType, sp hostarch.Addr) error {
 	addr = hostarch.UntaggedUserAddr(addr)
 	if pager, ok := mm.as.(platform.AddressSpaceFilePager); ok {
-		if handled, err := pager.ResolveFileFault(ctx, addr, at); handled || err != nil {
+		if handled, err := pager.ResolveFileFault(ctx, addr, at, false); handled || err != nil {
 			return err
 		}
 	}

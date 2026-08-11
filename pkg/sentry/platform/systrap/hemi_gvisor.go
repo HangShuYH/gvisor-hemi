@@ -60,11 +60,12 @@ const (
 var hemiGvisorZeroBuffer [hemiGvisorRingBatchBytes]byte
 
 var (
-	_ platform.AddressSpaceInitializer       = (*subprocess)(nil)
-	_ platform.AddressSpaceForker            = (*subprocess)(nil)
-	_ platform.AddressSpaceFilePager         = (*subprocess)(nil)
-	_ platform.AddressSpaceIOIter            = (*subprocess)(nil)
-	_ platform.AddressSpacePrivateFileMapper = (*subprocess)(nil)
+	_ platform.AddressSpaceInitializer               = (*subprocess)(nil)
+	_ platform.AddressSpaceForker                    = (*subprocess)(nil)
+	_ platform.AddressSpaceFilePager                 = (*subprocess)(nil)
+	_ platform.AddressSpaceIOIter                    = (*subprocess)(nil)
+	_ platform.AddressSpaceIOWriteIgnoresPermissions = (*subprocess)(nil)
+	_ platform.AddressSpacePrivateFileMapper         = (*subprocess)(nil)
 )
 
 type hemiGvisorRingEnterFunc func(int32, *linux.HemiUserspaceRingEnter) unix.Errno
@@ -559,7 +560,7 @@ func hemiGvisorContainsUserMem(addr hostarch.Addr, length uint64) bool {
 		end >= start && end <= linux.HEMI_USERSPACE_VMAR_END
 }
 
-func (s *subprocess) hemiGvisorUserMem(addr hostarch.Addr, data []byte, write bool) (int, error) {
+func (s *subprocess) hemiGvisorUserMem(addr hostarch.Addr, data []byte, access uint32) (int, error) {
 	if len(data) == 0 {
 		return 0, nil
 	}
@@ -576,10 +577,7 @@ func (s *subprocess) hemiGvisorUserMem(addr hostarch.Addr, data []byte, write bo
 		Addr:    uint64(addr),
 		UserBuf: uint64(uintptr(unsafe.Pointer(&data[0]))),
 		Len:     uint64(len(data)),
-		Access:  linux.HEMI_USERSPACE_ACCESS_READ,
-	}
-	if write {
-		req.Access = linux.HEMI_USERSPACE_ACCESS_WRITE
+		Access:  access,
 	}
 	errno := hostsyscall.RawSyscallErrno6(
 		unix.SYS_IOCTL, uintptr(device.fd), uintptr(linux.HEMI_USERSPACE_ACCESS),
@@ -906,7 +904,8 @@ func (s *subprocess) hemiGvisorCopyIn(addr hostarch.Addr, dst []byte) (int, erro
 	}
 	for done < len(dst) {
 		end := min(done+hemiGvisorUserMemMax, len(dst))
-		n, err := s.hemiGvisorUserMem(addr+hostarch.Addr(done), dst[done:end], false)
+		n, err := s.hemiGvisorUserMem(
+			addr+hostarch.Addr(done), dst[done:end], linux.HEMI_USERSPACE_ACCESS_READ)
 		done += n
 		if err != nil {
 			return done, err
@@ -940,7 +939,33 @@ func (s *subprocess) hemiGvisorCopyOut(addr hostarch.Addr, src []byte) (int, err
 	}
 	for done < len(src) {
 		end := min(done+hemiGvisorUserMemMax, len(src))
-		n, err := s.hemiGvisorUserMem(addr+hostarch.Addr(done), src[done:end], true)
+		n, err := s.hemiGvisorUserMem(
+			addr+hostarch.Addr(done), src[done:end], linux.HEMI_USERSPACE_ACCESS_WRITE)
+		done += n
+		if err != nil {
+			return done, err
+		}
+	}
+	return done, nil
+}
+
+// CopyOutIgnoringPermissions performs a privileged Sentry write through the
+// scalar portal. The Host preserves the Guest PTE permissions and establishes
+// private COW ownership before modifying an otherwise read-only frame.
+func (s *subprocess) CopyOutIgnoringPermissions(addr hostarch.Addr, src []byte) (int, error) {
+	if !hemiGvisorContainsUserMem(addr, uint64(len(src))) {
+		return 0, platform.AddressSpaceIOUnavailable{}
+	}
+	if len(src) == 0 {
+		return 0, nil
+	}
+
+	var done int
+	for done < len(src) {
+		end := min(done+hemiGvisorUserMemMax, len(src))
+		n, err := s.hemiGvisorUserMem(
+			addr+hostarch.Addr(done), src[done:end],
+			linux.HEMI_USERSPACE_ACCESS_WRITE|linux.HEMI_USERSPACE_ACCESS_IGNORE_PERMISSIONS)
 		done += n
 		if err != nil {
 			return done, err
@@ -1247,7 +1272,7 @@ func hemiGvisorTranslateFilePages(ctx context.Context, provider platform.Private
 
 // ResolveFileFault implements platform.AddressSpaceFilePager. HEMI owns the
 // mapping; gVisor only resolves the opaque file token returned by the core.
-func (s *subprocess) ResolveFileFault(ctx context.Context, addr hostarch.Addr, at hostarch.AccessType) (bool, error) {
+func (s *subprocess) ResolveFileFault(ctx context.Context, addr hostarch.Addr, at hostarch.AccessType, ignorePermissions bool) (bool, error) {
 	if !hemiGvisorContainsUserMem(addr, 1) {
 		return false, nil
 	}
@@ -1263,6 +1288,9 @@ func (s *subprocess) ResolveFileFault(ctx context.Context, addr hostarch.Addr, a
 		Phase:          linux.HEMI_USERSPACE_FILE_FAULT_QUERY,
 		TargetTGID:     s.hemiGvisorTGID,
 		TargetDeviceFD: device.fd,
+	}
+	if ignorePermissions {
+		req.ErrorCode |= linux.HEMI_USERSPACE_PF_IGNORE_PERMISSIONS
 	}
 	errno := hostsyscall.RawSyscallErrno6(
 		unix.SYS_IOCTL, uintptr(device.fd), uintptr(linux.HEMI_USERSPACE_FILE_FAULT),
