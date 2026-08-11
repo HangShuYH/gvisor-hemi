@@ -199,13 +199,25 @@ func (d *hemiGvisorDeviceState) drainReleaseLoop() {
 }
 
 func (d *hemiGvisorDeviceState) notifyReleaseDrain() {
-	if d == nil || d.releaseWake == nil {
+	if d == nil || d.releaseWake == nil || !d.releasesPending() {
 		return
 	}
 	select {
 	case d.releaseWake <- struct{}{}:
 	default:
 	}
+}
+
+func (d *hemiGvisorDeviceState) releasesPending() bool {
+	for queue := uint32(0); queue < d.releaseCount; queue++ {
+		offset := uint64(queue) * uint64(d.releaseStride)
+		ring := (*linux.HemiUserspaceReleaseRing)(
+			unsafe.Pointer(&d.releaseMapping[offset]))
+		if atomic.LoadUint32(&ring.Head) != atomic.LoadUint32(&ring.Tail) {
+			return true
+		}
+	}
+	return false
 }
 
 func hemiGvisorCurrentDevice() *hemiGvisorDeviceState {

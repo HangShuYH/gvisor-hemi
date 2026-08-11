@@ -265,6 +265,34 @@ func TestHemiGvisorDrainReleaseQueues(t *testing.T) {
 	}
 }
 
+func TestHemiGvisorNotifyReleaseDrainOnlyWhenPending(t *testing.T) {
+	const queueCount = 2
+	mapping := make([]byte, queueCount*linux.HEMI_USERSPACE_RELEASE_QUEUE_STRIDE)
+	device := &hemiGvisorDeviceState{
+		releaseMapping: mapping,
+		releaseCount:   queueCount,
+		releaseStride:  linux.HEMI_USERSPACE_RELEASE_QUEUE_STRIDE,
+		releaseWake:    make(chan struct{}, 1),
+	}
+
+	device.notifyReleaseDrain()
+	select {
+	case <-device.releaseWake:
+		t.Fatal("empty release queues triggered a drain")
+	default:
+	}
+
+	ring := (*linux.HemiUserspaceReleaseRing)(unsafe.Pointer(
+		&mapping[linux.HEMI_USERSPACE_RELEASE_QUEUE_STRIDE]))
+	atomic.StoreUint32(&ring.Tail, 1)
+	device.notifyReleaseDrain()
+	select {
+	case <-device.releaseWake:
+	default:
+		t.Fatal("pending release queue did not trigger a drain")
+	}
+}
+
 func TestHemiGvisorTranslateFilePages(t *testing.T) {
 	const (
 		guestOffset = uint64(0x2000)
