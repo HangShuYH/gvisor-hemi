@@ -846,6 +846,92 @@ func TestHemiGvisorAddressSpaceIOIterUsesRingBuffer(t *testing.T) {
 	}
 }
 
+func TestHemiGvisorHotAliasLazyAdmission(t *testing.T) {
+	const addr = hostarch.Addr(linux.HEMI_USERSPACE_VMAR_START)
+	var s subprocess
+
+	for i := 1; i < hemiGvisorHotAliasWarmup; i++ {
+		if ok, err := s.hemiGvisorPrepareHotAlias(addr, 1, 0); ok || err != nil {
+			t.Fatalf("attempt %d = (%t, %v), want (false, nil)", i, ok, err)
+		}
+		if cache := s.hemiGvisorHotAlias.Load(); cache != nil {
+			t.Fatalf("attempt %d allocated cache before warmup", i)
+		}
+	}
+	if ok, err := s.hemiGvisorPrepareHotAlias(addr, 1, 0); ok || err != nil {
+		t.Fatalf("warmup attempt = (%t, %v), want (false, nil)", ok, err)
+	}
+	if cache := s.hemiGvisorHotAlias.Load(); cache == nil {
+		t.Fatal("warmup attempt did not allocate cache")
+	}
+}
+
+func TestHemiGvisorHotAliasAdmissionRequiresStablePage(t *testing.T) {
+	s := &subprocess{}
+	base := hostarch.Addr(linux.HEMI_USERSPACE_VMAR_START)
+	for i := 0; i < 2*hemiGvisorHotAliasWarmup; i++ {
+		addr := base + hostarch.Addr(i&1)*hostarch.PageSize
+		if ok, err := s.hemiGvisorPrepareHotAlias(addr, 1, 0); ok || err != nil {
+			t.Fatalf("prepare(%#x) = (%t, %v), want (false, nil)", addr, ok, err)
+		}
+	}
+	if cache := s.hemiGvisorHotAlias.Load(); cache != nil {
+		t.Fatalf("alternating pages allocated cache: %+v", cache)
+	}
+}
+
+func TestHemiGvisorHotAliasIterDoesNotExposeAliasToStream(t *testing.T) {
+	const base = hostarch.Addr(linux.HEMI_USERSPACE_VMAR_START)
+	source := bytes.Repeat([]byte{0x5a}, 512)
+	cache := &hemiGvisorHotAliasCache{
+		mapping: make([]byte, hemiGvisorHotAliasSlots*hostarch.PageSize),
+	}
+	slot := hemiGvisorHotAliasSlot(base)
+	cache.keys[slot].Store(hemiGvisorHotAliasKey(
+		base, linux.HEMI_USERSPACE_ACCESS_WRITE))
+	s := subprocess{}
+	s.hemiGvisorHotAlias.Store(cache)
+	ars := hostarch.AddrRangeSeqOf(hostarch.AddrRange{
+		Start: base,
+		End:   base + hostarch.Addr(len(source)),
+	})
+
+	readerCalls := 0
+	reader := safemem.ReaderFunc(func(dsts safemem.BlockSeq) (uint64, error) {
+		readerCalls++
+		if dsts.Head().NeedSafecopy() {
+			return 0, unix.EFAULT
+		}
+		return safemem.CopySeq(dsts, safemem.BlockSeqOf(
+			safemem.BlockFromSafeSlice(source)))
+	})
+	n, err, ok := s.hemiGvisorTryHotAliasCopyOutFromIter(ars, reader, nil)
+	if !ok || err != nil || n != int64(len(source)) || readerCalls != 1 {
+		t.Fatalf("hot-alias CopyOutFromIter = (%d, %v, %t, calls:%d), want (%d, nil, true, calls:1)", n, err, ok, readerCalls, len(source))
+	}
+	offset := int(slot) * hostarch.PageSize
+	if got := cache.mapping[offset : offset+len(source)]; !bytes.Equal(got, source) {
+		t.Fatal("hot-alias CopyOutFromIter copied incorrect data")
+	}
+
+	var got bytes.Buffer
+	writerCalls := 0
+	writer := safemem.WriterFunc(func(srcs safemem.BlockSeq) (uint64, error) {
+		writerCalls++
+		if srcs.Head().NeedSafecopy() {
+			return 0, unix.EFAULT
+		}
+		return safemem.FromIOWriter{Writer: &got}.WriteFromBlocks(srcs)
+	})
+	n, err, ok = s.hemiGvisorTryHotAliasCopyInToIter(ars, writer, nil)
+	if !ok || err != nil || n != int64(len(source)) || writerCalls != 1 {
+		t.Fatalf("hot-alias CopyInToIter = (%d, %v, %t, calls:%d), want (%d, nil, true, calls:1)", n, err, ok, writerCalls, len(source))
+	}
+	if !bytes.Equal(got.Bytes(), source) {
+		t.Fatal("hot-alias CopyInToIter copied incorrect data")
+	}
+}
+
 func TestHemiGvisorAddressSpaceIOIterWaitsForRingLane(t *testing.T) {
 	lane := newTestHemiGvisorRingLane()
 	ringPool := newTestHemiGvisorRingPool(lane)

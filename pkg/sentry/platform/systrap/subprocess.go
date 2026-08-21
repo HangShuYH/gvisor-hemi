@@ -176,6 +176,9 @@ type subprocess struct {
 	// hemiGvisorDevice is the device instance controlling the current
 	// AddressSpace lifetime, or a failed FREE_MM retry.
 	hemiGvisorDevice *hemiGvisorDeviceState
+	// hemiGvisorHotAlias is allocated only after enough alias-eligible accesses.
+	hemiGvisorHotAlias          atomic.Pointer[hemiGvisorHotAliasCache]
+	hemiGvisorHotAliasAdmission atomic.Uint64
 
 	// sysmsgThreadsMu protects sysmsgThreads
 	sysmsgThreadsMu sync.RWMutex

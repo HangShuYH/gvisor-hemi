@@ -290,3 +290,41 @@ type HemiUserspaceReleaseSetup struct {
 }
 
 var HEMI_USERSPACE_SETUP_RELEASES = IOR(HEMI_USERSPACE_IOCTL_TYPE, 0x0c, uint32((*HemiUserspaceReleaseSetup)(nil).SizeBytes()))
+
+const (
+	HEMI_USERSPACE_HOT_ALIAS_SLOTS     = 64
+	HEMI_USERSPACE_HOT_ALIAS_MMAP_SIZE = HEMI_USERSPACE_HOT_ALIAS_SLOTS * 4096
+)
+
+// HemiUserspaceHotAliasSetup is struct hemi_userspace_hot_alias_setup.
+//
+// +marshal
+type HemiUserspaceHotAliasSetup struct {
+	_              structs.HostLayout
+	MMID           uint64
+	TargetTGID     int32
+	TargetDeviceFD int32
+	CacheID        uint64
+	MmapOffset     uint64
+	MmapSize       uint64
+}
+
+// HemiUserspaceHotAliasResolve is struct hemi_userspace_hot_alias_resolve.
+//
+// +marshal
+type HemiUserspaceHotAliasResolve struct {
+	_         structs.HostLayout
+	MMID      uint64
+	CacheID   uint64
+	Addr      uint64
+	FaultAddr uint64
+	Slot      uint32
+	Access    uint32
+	Result    int32
+	Reserved  uint32
+}
+
+var (
+	HEMI_USERSPACE_SETUP_HOT_ALIAS   = IOWR(HEMI_USERSPACE_IOCTL_TYPE, 0x0d, uint32((*HemiUserspaceHotAliasSetup)(nil).SizeBytes()))
+	HEMI_USERSPACE_RESOLVE_HOT_ALIAS = IOWR(HEMI_USERSPACE_IOCTL_TYPE, 0x0e, uint32((*HemiUserspaceHotAliasResolve)(nil).SizeBytes()))
+)
