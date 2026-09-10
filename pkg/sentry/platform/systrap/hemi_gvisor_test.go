@@ -27,6 +27,7 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
@@ -846,6 +847,384 @@ func TestHemiGvisorAddressSpaceIOIterUsesRingBuffer(t *testing.T) {
 	}
 }
 
+func TestHemiGvisorHotAliasLazyAdmission(t *testing.T) {
+	const addr = hostarch.Addr(linux.HEMI_USERSPACE_VMAR_START)
+	var s subprocess
+
+	for i := 1; i < hemiGvisorAliasCacheWarmup; i++ {
+		if _, err, ok := s.hemiGvisorGetHotAlias(addr, hemiGvisorHotAliasMinBytes, 0); ok || err != nil {
+			t.Fatalf("attempt %d = (%t, %v), want (false, nil)", i, ok, err)
+		}
+		if cache := s.hemiGvisorHotAlias.Load(); cache != nil {
+			t.Fatalf("attempt %d allocated cache before warmup", i)
+		}
+	}
+	if _, err, ok := s.hemiGvisorGetHotAlias(addr, hemiGvisorHotAliasMinBytes, 0); ok || err != nil {
+		t.Fatalf("warmup attempt = (%t, %v), want (false, nil)", ok, err)
+	}
+	if cache := s.hemiGvisorHotAlias.Load(); cache == nil {
+		t.Fatal("warmup attempt did not allocate cache")
+	}
+}
+
+func TestHemiGvisorHotAliasAdmissionDoesNotStarveAlternatingLanes(t *testing.T) {
+	s := &subprocess{}
+	base := hostarch.Addr(linux.HEMI_USERSPACE_VMAR_START)
+	other := base + hostarch.Addr(hemiGvisorAliasLaneSize)
+	for i := 0; i < hemiGvisorAliasCacheWarmup; i++ {
+		addr := base
+		if i&1 != 0 {
+			addr = other
+		}
+		if _, err, ok := s.hemiGvisorGetHotAlias(addr, hemiGvisorHotAliasMinBytes, 0); ok || err != nil {
+			t.Fatalf("prepare(%#x) = (%t, %v), want (false, nil)", addr, ok, err)
+		}
+	}
+	if cache := s.hemiGvisorHotAlias.Load(); cache == nil {
+		t.Fatal("alternating hot lanes starved cache initialization")
+	}
+}
+
+func TestHemiGvisorHotAliasAdmissionAggregatesLaneAccesses(t *testing.T) {
+	base := hostarch.Addr(linux.HEMI_USERSPACE_VMAR_START)
+	other := base + hostarch.PageSize
+	cache := new(hemiGvisorHotAliasCache)
+	s := subprocess{}
+	s.hemiGvisorHotAlias.Store(cache)
+
+	for i := 0; i < hemiGvisorAliasLaneWarmup-1; i++ {
+		addr := base
+		if i&1 != 0 {
+			addr = other
+		}
+		if _, err, ok := s.hemiGvisorGetHotAlias(addr, hemiGvisorHotAliasMinBytes, 0); ok || err != nil {
+			t.Fatalf("prepare(%#x) = (%t, %v), want (false, nil)", addr, ok, err)
+		}
+	}
+	for _, addr := range []hostarch.Addr{base, other} {
+		state := cache.seen[hemiGvisorHotAliasCandidate(addr)].Load()
+		if got := state & uint64(hemiGvisorAliasLaneSize-1); got != hemiGvisorAliasLaneWarmup-1 {
+			t.Fatalf("candidate(%#x) count = %d, want %d", addr, got, hemiGvisorAliasLaneWarmup-1)
+		}
+	}
+}
+
+func TestHemiGvisorHotAliasReplacesCollisionAfterProbation(t *testing.T) {
+	cache := &hemiGvisorHotAliasCache{
+		cacheID: 1,
+		mapping: make([]byte, int(hemiGvisorAliasMetaSize)),
+	}
+	addr := hostarch.Addr(linux.HEMI_USERSPACE_VMAR_START)
+	slot := hemiGvisorHotAliasSlot(addr)
+
+	for phase := 0; phase < 2; phase++ {
+		for i := 0; i < hemiGvisorCollisionWarmup; i++ {
+			admitted := cache.admitLane(addr, slot, 1, true)
+			if admitted != (phase == 1 && i == hemiGvisorCollisionWarmup-1) {
+				t.Fatalf("collision admission in phase %d at access %d = %t", phase, i, admitted)
+			}
+		}
+	}
+}
+
+func TestHemiGvisorHotAliasReadmitsPublishedLaneMiss(t *testing.T) {
+	base := hostarch.Addr(linux.HEMI_USERSPACE_VMAR_START)
+	cache := &hemiGvisorHotAliasCache{
+		cacheID: 1,
+		mapping: make([]byte, int(hemiGvisorAliasMetaSize)),
+	}
+	desc := cache.descriptor(hemiGvisorHotAliasSlot(base))
+	desc.PageBase = hemiGvisorAliasPageBase(base)
+	desc.Access = uint32(hemiGvisorHotAliasClass(0))
+	desc.Present[0] = 1
+	desc.Generation = 1
+	s := subprocess{}
+	s.hemiGvisorHotAlias.Store(cache)
+
+	missing := base + hostarch.PageSize
+	if _, err, ok := s.hemiGvisorGetHotAlias(missing, hemiGvisorHotAliasMinBytes, 0); ok || err != nil {
+		t.Fatalf("published lane miss = (%t, %v), want (false, nil)", ok, err)
+	}
+	state := cache.seen[hemiGvisorHotAliasCandidate(missing)].Load()
+	if got := state & uint64(hemiGvisorAliasLaneSize-1); got != 1 {
+		t.Fatalf("published lane miss admission count = %d, want 1", got)
+	}
+}
+
+func TestHemiGvisorHotAliasSlotUsesDirectLaneIndex(t *testing.T) {
+	base := hostarch.Addr(linux.HEMI_USERSPACE_VMAR_START)
+	stride := hostarch.Addr(hemiGvisorHotAliasSlots * hemiGvisorAliasLaneSize)
+	if first, second := hemiGvisorHotAliasSlot(base), hemiGvisorHotAliasSlot(base+stride); first != second {
+		t.Fatalf("ranges one cache span apart use slots %d and %d, want the same slot", first, second)
+	}
+}
+
+func TestHemiGvisorHotAliasRejectsCrossLaneRange(t *testing.T) {
+	base := hostarch.Addr(linux.HEMI_USERSPACE_VMAR_START)
+	addr := base + hostarch.Addr(hemiGvisorAliasLaneSize-hostarch.PageSize)
+	slot := hemiGvisorHotAliasSlot(addr)
+	cache := &hemiGvisorHotAliasCache{
+		cacheID: 1,
+		mapping: make([]byte, int(hemiGvisorAliasMetaSize)),
+	}
+	desc := cache.descriptor(slot)
+	desc.PageBase = uint64(base)
+	desc.Access = uint32(hemiGvisorHotAliasClass(0))
+	desc.Generation = 1
+	desc.Present[len(desc.Present)-1] = uint64(1) << 63
+
+	if _, _, ok := cache.load(addr, hostarch.PageSize+1, 0); ok {
+		t.Fatal("cross-lane range unexpectedly hit a hot alias")
+	}
+}
+
+func TestHemiGvisorHotAliasAcceptsCrossPageRange(t *testing.T) {
+	base := hostarch.Addr(linux.HEMI_USERSPACE_VMAR_START)
+	addr := base + hostarch.PageSize - 128
+	slot := hemiGvisorHotAliasSlot(addr)
+	cache := &hemiGvisorHotAliasCache{
+		cacheID: 1,
+		mapping: make([]byte, int(hemiGvisorAliasMetaSize)+
+			(int(slot)+1)*int(hemiGvisorAliasLaneSize)),
+	}
+	desc := cache.descriptor(slot)
+	desc.PageBase = uint64(base)
+	desc.Access = uint32(hemiGvisorHotAliasClass(0))
+	desc.Present[0] = 3
+	desc.Generation = 1
+	s := subprocess{}
+	s.hemiGvisorHotAlias.Store(cache)
+
+	alias, err, ok := s.hemiGvisorGetHotAlias(addr, 256, 0)
+	if !ok || err != nil {
+		t.Fatalf("cross-page alias = (%t, %v), want (true, nil)", ok, err)
+	}
+	alias.release()
+}
+
+func TestHemiGvisorHotAliasWaitsForMappingPublication(t *testing.T) {
+	cache := new(hemiGvisorHotAliasCache)
+	done := make(chan struct{})
+	go func() {
+		// Publish an immutable mapping while a reader still sees the cache's
+		// already-published Go object. A zero descriptor remains a miss.
+		cache.mapping = make([]byte, int(hemiGvisorAliasMetaSize))
+		atomic.StoreUint64(&cache.cacheID, 1)
+		close(done)
+	}()
+	for i := 0; i < 1000; i++ {
+		if _, _, hit := cache.load(hostarch.Addr(linux.HEMI_USERSPACE_VMAR_START), 1, 0); hit {
+			t.Fatal("unpopulated mapping produced an alias hit")
+		}
+	}
+	<-done
+}
+
+func TestHemiGvisorHotAliasReaderGuardsGeneration(t *testing.T) {
+	const base = hostarch.Addr(linux.HEMI_USERSPACE_VMAR_START)
+	slot := hemiGvisorHotAliasSlot(base)
+	cache := &hemiGvisorHotAliasCache{
+		cacheID: 1,
+		mapping: make([]byte, int(hemiGvisorAliasMetaSize)+
+			(int(slot)+1)*int(hemiGvisorAliasLaneSize)),
+	}
+	desc := cache.descriptor(slot)
+	desc.PageBase = uint64(base)
+	desc.Present[0] = 1
+	desc.Generation = 7
+
+	_, alias, ok := cache.load(base, 1, 0)
+	if !ok {
+		t.Fatal("published generation did not produce an alias reader")
+	}
+	wantState := uint64(7)
+	if state := atomic.LoadUint64(&alias.reader.State); state != wantState {
+		t.Fatalf("reader state = %#x, want %#x", state, wantState)
+	}
+	alias.release()
+	if state := atomic.LoadUint64(&alias.reader.State); state != 0 {
+		t.Fatalf("released reader state = %#x, want idle", state)
+	}
+	desc.Generation = 8
+	_, alias, ok = cache.load(base, 1, 0)
+	if !ok {
+		t.Fatal("reused slot did not acquire the new generation")
+	}
+	wantState = uint64(8)
+	if state := atomic.LoadUint64(&alias.reader.State); state != wantState {
+		t.Fatalf("reused reader state = %#x, want %#x", state, wantState)
+	}
+	alias.release()
+}
+
+func TestHemiGvisorHotAliasBusyGenerationFallsBack(t *testing.T) {
+	const base = hostarch.Addr(linux.HEMI_USERSPACE_VMAR_START)
+	slot := hemiGvisorHotAliasSlot(base)
+	cache := &hemiGvisorHotAliasCache{
+		cacheID: 1,
+		mapping: make([]byte, int(hemiGvisorAliasMetaSize)+
+			(int(slot)+1)*int(hemiGvisorAliasLaneSize)),
+	}
+	desc := cache.descriptor(slot)
+	desc.PageBase = uint64(base)
+	desc.Present[0] = 1
+	desc.Generation = 1
+	for shard := uint32(0); shard < linux.HEMI_USERSPACE_HOT_ALIAS_READER_SHARDS; shard++ {
+		atomic.StoreUint64(&cache.reader(slot, shard).State, 1)
+	}
+
+	if _, _, ok := cache.load(base, 1, 0); ok {
+		t.Fatal("hot alias acquired without a free reader record")
+	}
+}
+
+func TestHemiGvisorHotAliasIterUsesGenerationalAliasesDirectly(t *testing.T) {
+	const base = hostarch.Addr(linux.HEMI_USERSPACE_VMAR_START)
+	source := bytes.Repeat([]byte{0x5a}, hostarch.PageSize+512)
+	slot := hemiGvisorHotAliasSlot(base)
+	cache := &hemiGvisorHotAliasCache{
+		cacheID: 1,
+		mapping: make([]byte, int(hemiGvisorAliasMetaSize)+
+			(int(slot)+1)*int(hemiGvisorAliasLaneSize)),
+	}
+	desc := cache.descriptor(slot)
+	desc.PageBase = hemiGvisorAliasPageBase(base)
+	desc.Present[0] = 3
+	desc.Access = uint32(hemiGvisorHotAliasClass(linux.HEMI_USERSPACE_ACCESS_WRITE))
+	desc.Generation = 1
+	s := subprocess{}
+	s.hemiGvisorHotAlias.Store(cache)
+	ars := hostarch.AddrRangeSeqOf(hostarch.AddrRange{
+		Start: base,
+		End:   base + hostarch.Addr(len(source)),
+	})
+
+	readerCalls := 0
+	reader := safemem.ReaderFunc(func(dsts safemem.BlockSeq) (uint64, error) {
+		readerCalls++
+		if dsts.Head().NeedSafecopy() {
+			t.Fatal("hot alias was exposed as unsafe memory")
+		}
+		return safemem.CopySeq(dsts, safemem.BlockSeqOf(
+			safemem.BlockFromSafeSlice(source)))
+	})
+	n, err, ok := s.hemiGvisorTryHotAliasCopyOutFromIter(ars, reader, nil)
+	if !ok || err != nil || n != int64(len(source)) || readerCalls != 1 {
+		t.Fatalf("hot-alias CopyOutFromIter = (%d, %v, %t, calls:%d), want (%d, nil, true, calls:1)", n, err, ok, readerCalls, len(source))
+	}
+	offset := int(hemiGvisorAliasMetaSize) + int(slot)*int(hemiGvisorAliasLaneSize)
+	aliasContents := cache.mapping[offset : offset+len(source)]
+	if !bytes.Equal(aliasContents, source) {
+		t.Fatal("hot-alias CopyOutFromIter copied incorrect data")
+	}
+	var got bytes.Buffer
+	writerCalls := 0
+	writer := safemem.WriterFunc(func(srcs safemem.BlockSeq) (uint64, error) {
+		writerCalls++
+		if srcs.Head().NeedSafecopy() {
+			t.Fatal("hot alias was exposed as unsafe memory")
+		}
+		return safemem.FromIOWriter{Writer: &got}.WriteFromBlocks(srcs)
+	})
+	n, err, ok = s.hemiGvisorTryHotAliasCopyInToIter(ars, writer, nil)
+	if !ok || err != nil || n != int64(len(source)) || writerCalls != 1 {
+		t.Fatalf("hot-alias CopyInToIter = (%d, %v, %t, calls:%d), want (%d, nil, true, calls:1)", n, err, ok, writerCalls, len(source))
+	}
+	if !bytes.Equal(got.Bytes(), source) {
+		t.Fatal("hot-alias CopyInToIter copied incorrect data")
+	}
+
+	failingReader := safemem.ReaderFunc(func(safemem.BlockSeq) (uint64, error) {
+		return 0, linuxerr.EFAULT
+	})
+	if n, err, ok := s.hemiGvisorTryHotAliasCopyOutFromIter(ars, failingReader, nil); ok || err != nil || n != 0 {
+		t.Fatalf("faulted hot-alias CopyOutFromIter = (%d, %v, %t), want (0, nil, false)", n, err, ok)
+	}
+	failingWriter := safemem.WriterFunc(func(safemem.BlockSeq) (uint64, error) {
+		return 0, linuxerr.EFAULT
+	})
+	if n, err, ok := s.hemiGvisorTryHotAliasCopyInToIter(ars, failingWriter, nil); ok || err != nil || n != 0 {
+		t.Fatalf("faulted hot-alias CopyInToIter = (%d, %v, %t), want (0, nil, false)", n, err, ok)
+	}
+}
+
+func TestHemiGvisorHotAliasVectorHitAndMiss(t *testing.T) {
+	const base = hostarch.Addr(linux.HEMI_USERSPACE_VMAR_START)
+	const second = base + hostarch.Addr(hemiGvisorAliasLaneSize)
+	cache := &hemiGvisorHotAliasCache{
+		cacheID: 1,
+		mapping: make([]byte, int(hemiGvisorAliasMetaSize)+2*int(hemiGvisorAliasLaneSize)),
+	}
+	for _, addr := range []hostarch.Addr{base, second} {
+		desc := cache.descriptor(hemiGvisorHotAliasSlot(addr))
+		desc.PageBase = uint64(addr)
+		desc.Generation = 1
+		desc.Present[0] = 1
+		desc.Access = uint32(hemiGvisorHotAliasClass(linux.HEMI_USERSPACE_ACCESS_WRITE))
+	}
+	s := subprocess{}
+	s.hemiGvisorHotAlias.Store(cache)
+	ars := hostarch.AddrRangeSeqFromSlice([]hostarch.AddrRange{
+		{Start: base, End: base + 1000},
+		{Start: second + 100, End: second + 3100},
+	})
+	data := bytes.Repeat([]byte{0x39}, 4000)
+	calls := 0
+	reader := safemem.ReaderFunc(func(blocks safemem.BlockSeq) (uint64, error) {
+		calls++
+		return safemem.CopySeq(blocks, safemem.BlockSeqOf(safemem.BlockFromSafeSlice(data)))
+	})
+	if n, err, ok := s.hemiGvisorTryHotAliasCopyOutFromIter(ars, reader, nil); n != 4000 || err != nil || !ok || calls != 1 {
+		t.Fatalf("vector write = (%d, %v, %t), calls=%d", n, err, ok, calls)
+	}
+	var got bytes.Buffer
+	if n, err, ok := s.hemiGvisorTryHotAliasCopyInToIter(ars, safemem.FromIOWriter{Writer: &got}, nil); n != 4000 || err != nil || !ok || !bytes.Equal(got.Bytes(), data) {
+		t.Fatalf("vector read = (%d, %v, %t), equal=%t", n, err, ok, bytes.Equal(got.Bytes(), data))
+	}
+	cache.descriptor(hemiGvisorHotAliasSlot(second)).Generation = 0
+	if n, err, ok := s.hemiGvisorTryHotAliasCopyOutFromIter(ars, reader, nil); n != 0 || err != nil || ok || calls != 1 {
+		t.Fatalf("vector miss consumed stream: (%d, %v, %t), calls=%d", n, err, ok, calls)
+	}
+	for slot := uint32(0); slot < 2; slot++ {
+		for shard := uint32(0); shard < linux.HEMI_USERSPACE_HOT_ALIAS_READER_SHARDS; shard++ {
+			if cache.reader(slot, shard).State != 0 {
+				t.Fatal("vector leaked a reader on hit or miss")
+			}
+		}
+	}
+}
+
+func TestHemiGvisorHotAliasAtomicUint32(t *testing.T) {
+	const base = hostarch.Addr(linux.HEMI_USERSPACE_VMAR_START)
+	slot := hemiGvisorHotAliasSlot(base)
+	cache := &hemiGvisorHotAliasCache{
+		cacheID: 1,
+		mapping: make([]byte, int(hemiGvisorAliasMetaSize)+
+			(int(slot)+1)*int(hemiGvisorAliasLaneSize)),
+	}
+	desc := cache.descriptor(slot)
+	desc.PageBase = hemiGvisorAliasPageBase(base)
+	desc.Present[0] = 1
+	desc.Access = uint32(hemiGvisorHotAliasClass(linux.HEMI_USERSPACE_ACCESS_WRITE))
+	desc.Generation = 1
+	s := subprocess{}
+	s.hemiGvisorHotAlias.Store(cache)
+
+	word := (*uint32)(cache.pointer(slot, base))
+	*word = 7
+	if value, err, ok := s.hemiGvisorTryHotAliasAtomicUint32(
+		base, linux.HEMI_USERSPACE_ATOMIC_U32_CMPXCHG, 7, 11); !ok || err != nil || value != 7 {
+		t.Fatalf("hot-alias cmpxchg = (%d, %v, %t), want (7, nil, true)", value, err, ok)
+	}
+	if value, err, ok := s.hemiGvisorTryHotAliasAtomicUint32(
+		base, linux.HEMI_USERSPACE_ATOMIC_U32_ADD, 0, 5); !ok || err != nil || value != 11 {
+		t.Fatalf("hot-alias add = (%d, %v, %t), want (11, nil, true)", value, err, ok)
+	}
+	if value := atomic.LoadUint32(word); value != 16 {
+		t.Fatalf("hot-alias atomic value = %d, want 16", value)
+	}
+}
+
 func TestHemiGvisorAddressSpaceIOIterWaitsForRingLane(t *testing.T) {
 	lane := newTestHemiGvisorRingLane()
 	ringPool := newTestHemiGvisorRingPool(lane)
@@ -858,7 +1237,7 @@ func TestHemiGvisorAddressSpaceIOIterWaitsForRingLane(t *testing.T) {
 	}
 	ars := hostarch.AddrRangeSeqOf(hostarch.AddrRange{
 		Start: hostarch.Addr(linux.HEMI_USERSPACE_VMAR_START),
-		End:   hostarch.Addr(linux.HEMI_USERSPACE_VMAR_START + 1),
+		End:   hostarch.Addr(linux.HEMI_USERSPACE_VMAR_START + hemiGvisorRingMinBytes),
 	})
 	type result struct {
 		n   int64
@@ -891,8 +1270,8 @@ func TestHemiGvisorAddressSpaceIOIterWaitsForRingLane(t *testing.T) {
 	}
 	ringPool.release(held)
 	got := <-resultCh
-	if got.n != 1 || got.err != nil {
-		t.Fatalf("stream after ring lane release = (%d, %v), want (1, nil)", got.n, got.err)
+	if got.n != hemiGvisorRingMinBytes || got.err != nil {
+		t.Fatalf("stream after ring lane release = (%d, %v), want (%d, nil)", got.n, got.err, hemiGvisorRingMinBytes)
 	}
 }
 
@@ -947,6 +1326,49 @@ func TestHemiGvisorAddressSpaceIOIterRetriesFileFaultWithoutRereading(t *testing
 	}
 	if readerCalls != 1 || enterCalls != 2 || faultCalls != 1 {
 		t.Fatalf("retry calls = (reader:%d, enter:%d, fault:%d), want (1, 2, 1)", readerCalls, enterCalls, faultCalls)
+	}
+}
+
+func TestHemiGvisorAddressSpaceIOIterRetriesPartialWriteFileFault(t *testing.T) {
+	lane := newTestHemiGvisorRingLane()
+	s := subprocess{
+		hemiGvisorDevice: &hemiGvisorDeviceState{fd: 3, ringPool: newTestHemiGvisorRingPool(lane)},
+		hemiGvisorTGID:   1,
+		hemiGvisorMMID:   5,
+	}
+	const base = hostarch.Addr(linux.HEMI_USERSPACE_VMAR_START)
+	source := make([]byte, 3*hostarch.PageSize)
+	for i := range source {
+		source[i] = byte(i / hostarch.PageSize)
+	}
+	readerCalls, enterCalls, faultCalls := 0, 0, 0
+	reader := safemem.ReaderFunc(func(dsts safemem.BlockSeq) (uint64, error) {
+		readerCalls++
+		return safemem.CopySeq(dsts, safemem.BlockSeqOf(safemem.BlockFromSafeSlice(source)))
+	})
+	enter := func(int32, *linux.HemiUserspaceRingEnter) unix.Errno {
+		desc := lane.descriptor(0)
+		offset := enterCalls * hostarch.PageSize
+		if desc.Addr != uint64(base)+uint64(offset) || !bytes.Equal(lane.data(0, int(desc.Len)), source[offset:]) {
+			t.Fatal("partial retry lost or repeated stream bytes")
+		}
+		enterCalls++
+		desc.Done = hostarch.PageSize
+		if enterCalls < 3 {
+			desc.Result = -int32(unix.EAGAIN)
+		}
+		return 0
+	}
+	handleFault := func(addr hostarch.Addr, at hostarch.AccessType) error {
+		faultCalls++
+		if addr != base+hostarch.Addr(faultCalls*hostarch.PageSize) || at != hostarch.Write {
+			t.Fatalf("unexpected partial fault: %#x %v", addr, at)
+		}
+		return nil
+	}
+	ars := hostarch.AddrRangeSeqOf(hostarch.AddrRange{Start: base, End: base + hostarch.Addr(len(source))})
+	if n, err := s.copyOutFromIter(ars, reader, handleFault, enter); n != int64(len(source)) || err != nil || readerCalls != 1 || faultCalls != 2 {
+		t.Fatalf("partial write retry = %d, %v; reads=%d faults=%d", n, err, readerCalls, faultCalls)
 	}
 }
 

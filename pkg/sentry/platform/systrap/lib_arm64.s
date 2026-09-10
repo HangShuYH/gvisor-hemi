@@ -30,3 +30,8 @@ TEXT ·getCNTFRQ(SB),NOSPLIT,$0-8
 	WORD	$0xd53be000     //MRS	CNTFRQ_EL0, R0
 	MOVD	R0, ret+0(FP)
 	RET
+
+TEXT ·hemiGvisorReleaseAliasReader(SB),NOSPLIT|NOFRAME,$0-8
+	MOVD	state+0(FP), R0
+	STLR	ZR, (R0)
+	RET

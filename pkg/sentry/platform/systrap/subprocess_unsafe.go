@@ -50,6 +50,11 @@ func cputicks() int64
 // spinloop is implemented in assembly.
 func spinloop()
 
+// hemiGvisorReleaseAliasReader publishes the end of an alias access with a
+// release store. The reader record is exclusively owned by the caller after a
+// successful CAS, so a sequentially consistent atomic exchange is unnecessary.
+func hemiGvisorReleaseAliasReader(state *uint64)
+
 // getThreadContextFromID returns a ThreadContext struct that corresponds to the
 // given ID.
 //

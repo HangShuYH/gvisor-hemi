@@ -290,3 +290,63 @@ type HemiUserspaceReleaseSetup struct {
 }
 
 var HEMI_USERSPACE_SETUP_RELEASES = IOR(HEMI_USERSPACE_IOCTL_TYPE, 0x0c, uint32((*HemiUserspaceReleaseSetup)(nil).SizeBytes()))
+
+const (
+	HEMI_USERSPACE_HOT_ALIAS_SLOTS         = 1024
+	HEMI_USERSPACE_HOT_ALIAS_LANE_SIZE     = 2 * 1024 * 1024
+	HEMI_USERSPACE_HOT_ALIAS_PAGES         = 512
+	HEMI_USERSPACE_HOT_ALIAS_BITMAP_WORDS  = HEMI_USERSPACE_HOT_ALIAS_PAGES / 64
+	HEMI_USERSPACE_HOT_ALIAS_PROTOCOL      = 4
+	HEMI_USERSPACE_HOT_ALIAS_READER_SHARDS = 16
+	HEMI_USERSPACE_HOT_ALIAS_READER_OFFSET = 20 * 4096
+	HEMI_USERSPACE_HOT_ALIAS_META_SIZE     = 52 * 4096
+	HEMI_USERSPACE_HOT_ALIAS_MMAP_SIZE     = HEMI_USERSPACE_HOT_ALIAS_META_SIZE + HEMI_USERSPACE_HOT_ALIAS_SLOTS*HEMI_USERSPACE_HOT_ALIAS_LANE_SIZE
+)
+
+// HemiUserspaceHotAliasDescriptor is a Host-published generational lane snapshot.
+type HemiUserspaceHotAliasDescriptor struct {
+	PageBase   uint64
+	Present    [HEMI_USERSPACE_HOT_ALIAS_BITMAP_WORDS]uint64
+	Access     uint32
+	Generation uint32
+}
+
+// HemiUserspaceHotAliasReader contains the generation held by one reader.
+type HemiUserspaceHotAliasReader struct {
+	State uint64
+}
+
+// HemiUserspaceHotAliasSetup is struct hemi_userspace_hot_alias_setup.
+//
+// +marshal
+type HemiUserspaceHotAliasSetup struct {
+	_              structs.HostLayout
+	MMID           uint64
+	TargetTGID     int32
+	TargetDeviceFD int32
+	CacheID        uint64
+	MmapOffset     uint64
+	MmapSize       uint64
+	Protocol       uint32
+	_              uint32
+}
+
+// HemiUserspaceHotAliasResolve is struct hemi_userspace_hot_alias_resolve.
+//
+// +marshal
+type HemiUserspaceHotAliasResolve struct {
+	_         structs.HostLayout
+	MMID      uint64
+	CacheID   uint64
+	Addr      uint64
+	FaultAddr uint64
+	Slot      uint32
+	Access    uint32
+	Result    int32
+	Len       uint32
+}
+
+var (
+	HEMI_USERSPACE_SETUP_HOT_ALIAS   = IOWR(HEMI_USERSPACE_IOCTL_TYPE, 0x0d, uint32((*HemiUserspaceHotAliasSetup)(nil).SizeBytes()))
+	HEMI_USERSPACE_RESOLVE_HOT_ALIAS = IOWR(HEMI_USERSPACE_IOCTL_TYPE, 0x0e, uint32((*HemiUserspaceHotAliasResolve)(nil).SizeBytes()))
+)

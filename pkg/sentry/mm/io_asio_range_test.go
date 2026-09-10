@@ -30,6 +30,7 @@ type rangeAwareTestAddressSpace struct {
 	platform.AddressSpace
 	applicableRange     hostarch.AddrRange
 	applicabilityCalls  int
+	allSizesCalls       int
 	sawEmptyRange       bool
 	copyInCalls         int
 	copyOutCalls        int
@@ -56,8 +57,26 @@ func (as *rangeAwareTestAddressSpace) AddressSpaceIOApplicablePrefix(ar hostarch
 	return ar.Length(), false
 }
 
-func (*rangeAwareTestAddressSpace) AddressSpaceIOAllSizes() bool {
+func (as *rangeAwareTestAddressSpace) AddressSpaceIOAllSizes() bool {
+	as.allSizesCalls++
 	return true
+}
+
+func TestASIOSizeCheckSkipsUnneededOverride(t *testing.T) {
+	mm, as := newRangeAwareTestMemoryManager()
+	if !mm.asioEnabledForSize(usermem.IOOpts{}, 512, copyMapMinBytes) || as.allSizesCalls != 0 {
+		t.Fatal("small copy should qualify without querying the size override")
+	}
+	if !mm.asioEnabledForSize(usermem.IOOpts{}, copyMapMinBytes, copyMapMinBytes) || as.allSizesCalls != 1 {
+		t.Fatal("copy at the threshold must query the size override")
+	}
+	if mm.asioEnabledForSize(usermem.IOOpts{IgnorePermissions: true}, 512, copyMapMinBytes) || as.allSizesCalls != 1 {
+		t.Fatal("size must not bypass the permission policy")
+	}
+	mm.haveASIO = false
+	if mm.asioEnabledForSize(usermem.IOOpts{}, 512, copyMapMinBytes) || as.allSizesCalls != 1 {
+		t.Fatal("size must not enable an unavailable AddressSpaceIO")
+	}
 }
 
 func (as *rangeAwareTestAddressSpace) CopyOut(addr hostarch.Addr, src []byte) (int, error) {

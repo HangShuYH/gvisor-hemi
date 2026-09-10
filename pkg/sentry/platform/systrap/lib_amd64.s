@@ -26,3 +26,8 @@ TEXT ·cputicks(SB),NOSPLIT|NOFRAME,$0-8
 	ADDQ	DX, AX
 	MOVQ	AX, ret+0(FP)
 	RET
+
+TEXT ·hemiGvisorReleaseAliasReader(SB),NOSPLIT|NOFRAME,$0-8
+	MOVQ	state+0(FP), AX
+	MOVQ	$0, 0(AX)
+	RET

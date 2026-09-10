@@ -197,10 +197,13 @@ func (mm *MemoryManager) asioEnabledForSize(opts usermem.IOOpts, size, threshold
 	if !mm.asioEnabled(opts) {
 		return false
 	}
-	if asio, ok := mm.as.(platform.AddressSpaceIOAllSizes); ok && asio.AddressSpaceIOAllSizes() {
+	// Small copies already qualify. Only larger copies need the optional
+	// override; avoid querying it on every scalar user-memory access.
+	if size < threshold {
 		return true
 	}
-	return size < threshold
+	asio, ok := mm.as.(platform.AddressSpaceIOAllSizes)
+	return ok && asio.AddressSpaceIOAllSizes()
 }
 
 func (mm *MemoryManager) asioReadEnabledForSize(opts usermem.IOOpts, size, threshold uint64) bool {

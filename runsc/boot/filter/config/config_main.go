@@ -169,6 +169,16 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 			seccomp.EqualTo(linux.HEMI_USERSPACE_SETUP_RELEASES),
 			seccomp.AnyValue{},
 		},
+		seccomp.PerArg{
+			seccomp.NonNegativeFD{},
+			seccomp.EqualTo(linux.HEMI_USERSPACE_SETUP_HOT_ALIAS),
+			seccomp.AnyValue{},
+		},
+		seccomp.PerArg{
+			seccomp.NonNegativeFD{},
+			seccomp.EqualTo(linux.HEMI_USERSPACE_RESOLVE_HOT_ALIAS),
+			seccomp.AnyValue{},
+		},
 		// These commands are needed for host FD.
 		seccomp.PerArg{
 			seccomp.NonNegativeFD{}, /* fd */
