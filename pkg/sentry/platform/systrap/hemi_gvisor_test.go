@@ -411,6 +411,7 @@ func TestHemiGvisorKeepSyscallUnpatched(t *testing.T) {
 		unix.SYS_MUNMAP,
 		unix.SYS_MPROTECT,
 		unix.SYS_BRK,
+		unix.SYS_MADVISE,
 	} {
 		if inactive.hemiGvisorKeepSyscallUnpatched(sysno) {
 			t.Errorf("inactive HEMI subprocess kept memory syscall %d unpatched", sysno)

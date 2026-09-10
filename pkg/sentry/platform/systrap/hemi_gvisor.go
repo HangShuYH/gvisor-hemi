@@ -996,7 +996,7 @@ func (s *subprocess) hemiGvisorKeepSyscallUnpatched(sysno uintptr) bool {
 		return false
 	}
 	switch sysno {
-	case unix.SYS_MMAP, unix.SYS_MUNMAP, unix.SYS_MPROTECT, unix.SYS_BRK:
+	case unix.SYS_MMAP, unix.SYS_MUNMAP, unix.SYS_MPROTECT, unix.SYS_BRK, unix.SYS_MADVISE:
 		return true
 	default:
 		return false
