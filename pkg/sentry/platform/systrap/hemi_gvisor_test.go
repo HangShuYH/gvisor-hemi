@@ -916,11 +916,9 @@ func TestHemiGvisorHotAliasReplacesCollisionAfterProbation(t *testing.T) {
 		mapping: make([]byte, int(hemiGvisorAliasMetaSize)),
 	}
 	addr := hostarch.Addr(linux.HEMI_USERSPACE_VMAR_START)
-	slot := hemiGvisorHotAliasSlot(addr)
-
 	for phase := 0; phase < 2; phase++ {
 		for i := 0; i < hemiGvisorCollisionWarmup; i++ {
-			admitted := cache.admitLane(addr, slot, 1, true)
+			admitted := cache.admitLane(addr, 1, true)
 			if admitted != (phase == 1 && i == hemiGvisorCollisionWarmup-1) {
 				t.Fatalf("collision admission in phase %d at access %d = %t", phase, i, admitted)
 			}

@@ -529,7 +529,7 @@ func (s *subprocess) unmap() {
 func (s *subprocess) Release() {
 	s.hemiGvisorReleaseAddressSpace()
 	if !s.alive() {
-		s.hemiGvisorDestroyAddressSpace()
+		s.hemiGvisorReleaseAddressSpace()
 		return
 	}
 	s.unmap()
@@ -542,7 +542,7 @@ func (s *subprocess) release() {
 		globalPool.markAvailable(s)
 		return
 	}
-	s.hemiGvisorDestroyAddressSpace()
+	s.hemiGvisorReleaseAddressSpace()
 	if s.syscallThread != nil && s.syscallThread.seccompNotify != nil {
 		s.syscallThread.seccompNotify.Close()
 	}

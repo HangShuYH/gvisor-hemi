@@ -303,10 +303,6 @@ func hemiGvisorAliasPageBase(addr hostarch.Addr) uint64 {
 	return uint64(addr) &^ uint64(hemiGvisorAliasLaneSize-1)
 }
 
-func hemiGvisorAliasAdmissionBase(addr hostarch.Addr) uint64 {
-	return hemiGvisorAliasPageBase(addr)
-}
-
 func (s *subprocess) hemiGvisorAdmitHotAliasCache() bool {
 	// Count workload activity, not consecutive accesses to one lane: a busy
 	// workload can alternate stack and heap forever without such a streak.
@@ -415,10 +411,10 @@ func (c *hemiGvisorHotAliasCache) load(addr hostarch.Addr, length int, access ui
 	return slot, hemiGvisorHotAliasAccess{}, false
 }
 
-func (c *hemiGvisorHotAliasCache) admitLane(addr hostarch.Addr, slot, generation uint32, collision bool) bool {
+func (c *hemiGvisorHotAliasCache) admitLane(addr hostarch.Addr, generation uint32, collision bool) bool {
 	index := hemiGvisorHotAliasCandidate(addr)
 	candidate := &c.seen[index]
-	base := hemiGvisorAliasAdmissionBase(addr)
+	base := hemiGvisorAliasPageBase(addr)
 	warmup := uint64(hemiGvisorAliasLaneWarmup)
 	if collision {
 		warmup = hemiGvisorCollisionWarmup
@@ -458,7 +454,7 @@ func (c *hemiGvisorHotAliasCache) admitLane(addr hostarch.Addr, slot, generation
 
 func (c *hemiGvisorHotAliasCache) resetLaneAdmission(addr hostarch.Addr) {
 	index := hemiGvisorHotAliasCandidate(addr)
-	c.seen[index].Store(hemiGvisorAliasAdmissionBase(addr))
+	c.seen[index].Store(hemiGvisorAliasPageBase(addr))
 	c.observed[index].Store(0)
 }
 
@@ -568,7 +564,7 @@ func (s *subprocess) hemiGvisorResolveHotAlias(addr hostarch.Addr, length int, a
 
 func (s *subprocess) hemiGvisorGetHotAlias(addr hostarch.Addr, length int, access uint32) (hemiGvisorHotAliasAccess, error, bool) {
 	if length < hemiGvisorHotAliasMinBytes || length > hemiGvisorHotAliasMaxBytes ||
-		hemiGvisorAliasAdmissionBase(addr) != hemiGvisorAliasAdmissionBase(addr+hostarch.Addr(length-1)) {
+		hemiGvisorAliasPageBase(addr) != hemiGvisorAliasPageBase(addr+hostarch.Addr(length-1)) {
 		return hemiGvisorHotAliasAccess{}, nil, false
 	}
 	cache := s.hemiGvisorHotAlias.Load()
@@ -579,7 +575,7 @@ func (s *subprocess) hemiGvisorGetHotAlias(addr hostarch.Addr, length int, acces
 		candidate := new(hemiGvisorHotAliasCache)
 		index := hemiGvisorHotAliasCandidate(addr)
 		candidate.seen[index].Store(
-			hemiGvisorAliasAdmissionBase(addr) | hemiGvisorAliasLaneWarmup)
+			hemiGvisorAliasPageBase(addr) | hemiGvisorAliasLaneWarmup)
 		if s.hemiGvisorHotAlias.CompareAndSwap(nil, candidate) {
 			cache = candidate
 		} else {
@@ -598,7 +594,7 @@ func (s *subprocess) hemiGvisorGetHotAlias(addr hostarch.Addr, length int, acces
 		collision = generation != 0 &&
 			desc.PageBase != hemiGvisorAliasPageBase(addr)
 	}
-	if !cache.admitLane(addr, slot, generation, collision) {
+	if !cache.admitLane(addr, generation, collision) {
 		return hemiGvisorHotAliasAccess{}, nil, false
 	}
 
@@ -856,15 +852,8 @@ func (s *subprocess) hemiGvisorPrepareAddressSpace() error {
 	return nil
 }
 
-// InitializeAddressSpace implements platform.AddressSpaceInitializer for a new,
-// empty guest address space.
-func (s *subprocess) InitializeAddressSpace() error {
-	if s.hemiGvisorDevice == nil {
-		return nil
-	}
-	return s.hemiGvisorAllocMM()
-}
-
+// hemiGvisorReleaseAddressSpace also covers a subprocess that died before
+// it could be returned to the pool; FREE_MM is idempotent.
 func (s *subprocess) hemiGvisorReleaseAddressSpace() {
 	if err := s.hemiGvisorFreeMM(); err != nil {
 		log.Warningf("HEMI gVisor failed to free AddressSpace: %v", err)
@@ -877,14 +866,9 @@ func (s *subprocess) hemiGvisorReleaseAddressSpace() {
 	s.hemiGvisorDevice = nil
 }
 
-// hemiGvisorDestroyAddressSpace is idempotent with the normal Release path and
-// covers a subprocess that died before it could be returned to the pool.
-func (s *subprocess) hemiGvisorDestroyAddressSpace() {
-	s.hemiGvisorReleaseAddressSpace()
-}
-
-// hemiGvisorAllocMM creates an empty Host-managed address-space state.
-func (s *subprocess) hemiGvisorAllocMM() error {
+// InitializeAddressSpace implements platform.AddressSpaceInitializer for a new,
+// empty guest address space.
+func (s *subprocess) InitializeAddressSpace() error {
 	device := s.hemiGvisorDevice
 	if device == nil {
 		return nil
@@ -928,11 +912,9 @@ func (s *subprocess) hemiGvisorFreeMM() error {
 	}
 	cache := s.hemiGvisorHotAlias.Swap(nil)
 	s.hemiGvisorHotAliasAdmission.Store(0)
-	if cache != nil {
-		if len(cache.mapping) != 0 {
-			if err := memutil.UnmapSlice(cache.mapping); err != nil {
-				log.Debugf("HEMI hot alias unmap for MMID %d: %v", mmid, err)
-			}
+	if cache != nil && len(cache.mapping) != 0 {
+		if err := memutil.UnmapSlice(cache.mapping); err != nil {
+			log.Debugf("HEMI hot alias unmap for MMID %d: %v", mmid, err)
 		}
 	}
 	req := linux.HemiUserspaceFreeMM{MMID: mmid}
@@ -1491,15 +1473,16 @@ func (s *subprocess) CopyIn(addr hostarch.Addr, dst []byte) (int, error) {
 		addr, dst, linux.HEMI_USERSPACE_ACCESS_READ); ok {
 		return n, err
 	}
-	return s.hemiGvisorCopyIn(addr, dst)
+	return s.hemiGvisorCopy(addr, dst, linux.HEMI_USERSPACE_ACCESS_READ, linux.HEMI_USERSPACE_RING_OP_READ)
 }
 
-// hemiGvisorCopyIn copies target memory into dst.
-func (s *subprocess) hemiGvisorCopyIn(addr hostarch.Addr, dst []byte) (int, error) {
+// hemiGvisorCopy preserves partial ring progress when falling back to scalar
+// access. Callers handle alias hits before reaching this path.
+func (s *subprocess) hemiGvisorCopy(addr hostarch.Addr, buf []byte, access uint32, op uint16) (int, error) {
 	var done int
 	if device := s.hemiGvisorDevice; device != nil && s.hemiGvisorActive() {
 		if n, err, ok := device.tryRingTransfer(
-			s.hemiGvisorMMID, addr+hostarch.Addr(done), dst[done:], linux.HEMI_USERSPACE_RING_OP_READ); ok {
+			s.hemiGvisorMMID, addr, buf, op); ok {
 			done += n
 			var enterErr *hemiGvisorRingEnterError
 			if err == nil || !errors.As(err, &enterErr) {
@@ -1507,10 +1490,10 @@ func (s *subprocess) hemiGvisorCopyIn(addr hostarch.Addr, dst []byte) (int, erro
 			}
 		}
 	}
-	for done < len(dst) {
-		end := min(done+hemiGvisorUserMemMax, len(dst))
+	for done < len(buf) {
+		end := min(done+hemiGvisorUserMemMax, len(buf))
 		n, err := s.hemiGvisorUserMem(
-			addr+hostarch.Addr(done), dst[done:end], linux.HEMI_USERSPACE_ACCESS_READ)
+			addr+hostarch.Addr(done), buf[done:end], access)
 		done += n
 		if err != nil {
 			return done, err
@@ -1530,12 +1513,12 @@ func (s *subprocess) CopyOut(addr hostarch.Addr, src []byte) (int, error) {
 		addr, src, linux.HEMI_USERSPACE_ACCESS_WRITE); ok {
 		return n, err
 	}
-	return s.hemiGvisorCopyOut(addr, src)
+	return s.hemiGvisorCopy(addr, src, linux.HEMI_USERSPACE_ACCESS_WRITE, linux.HEMI_USERSPACE_RING_OP_WRITE)
 }
 
 func (s *subprocess) hemiGvisorTryHotAliasCopy(addr hostarch.Addr, buf []byte, access uint32) (int, error, bool) {
 	if len(buf) > hemiGvisorHotAliasHitBytes ||
-		hemiGvisorAliasAdmissionBase(addr) != hemiGvisorAliasAdmissionBase(addr+hostarch.Addr(len(buf)-1)) {
+		hemiGvisorAliasPageBase(addr) != hemiGvisorAliasPageBase(addr+hostarch.Addr(len(buf)-1)) {
 		return 0, nil, false
 	}
 	alias, err, ok := s.hemiGvisorGetHotAliasForCopy(addr, len(buf), access)
@@ -1550,31 +1533,6 @@ func (s *subprocess) hemiGvisorTryHotAliasCopy(addr hostarch.Addr, buf []byte, a
 	}
 	alias.release()
 	return len(buf), nil, true
-}
-
-// hemiGvisorCopyOut copies src into target memory.
-func (s *subprocess) hemiGvisorCopyOut(addr hostarch.Addr, src []byte) (int, error) {
-	var done int
-	if device := s.hemiGvisorDevice; device != nil && s.hemiGvisorActive() {
-		if n, err, ok := device.tryRingTransfer(
-			s.hemiGvisorMMID, addr+hostarch.Addr(done), src[done:], linux.HEMI_USERSPACE_RING_OP_WRITE); ok {
-			done += n
-			var enterErr *hemiGvisorRingEnterError
-			if err == nil || !errors.As(err, &enterErr) {
-				return done, err
-			}
-		}
-	}
-	for done < len(src) {
-		end := min(done+hemiGvisorUserMemMax, len(src))
-		n, err := s.hemiGvisorUserMem(
-			addr+hostarch.Addr(done), src[done:end], linux.HEMI_USERSPACE_ACCESS_WRITE)
-		done += n
-		if err != nil {
-			return done, err
-		}
-	}
-	return done, nil
 }
 
 // CopyOutIgnoringPermissions performs a privileged Sentry write through the
@@ -1612,8 +1570,9 @@ func (s *subprocess) ZeroOut(addr hostarch.Addr, toZero uintptr) (uintptr, error
 	var done uintptr
 	for done < toZero {
 		length := min(toZero-done, uintptr(len(hemiGvisorZeroBuffer)))
-		n, err := s.hemiGvisorCopyOut(
-			addr+hostarch.Addr(done), hemiGvisorZeroBuffer[:length])
+		n, err := s.hemiGvisorCopy(
+			addr+hostarch.Addr(done), hemiGvisorZeroBuffer[:length],
+			linux.HEMI_USERSPACE_ACCESS_WRITE, linux.HEMI_USERSPACE_RING_OP_WRITE)
 		done += uintptr(n)
 		if err != nil {
 			return done, err
@@ -1705,27 +1664,6 @@ func (s *subprocess) hemiGvisorTryHotAliasAtomicUint32(addr hostarch.Addr, op, o
 		}
 	case linux.HEMI_USERSPACE_ATOMIC_U32_ADD:
 		value = atomic.AddUint32(word, new) - new
-	case linux.HEMI_USERSPACE_ATOMIC_U32_OR:
-		for {
-			value = atomic.LoadUint32(word)
-			if atomic.CompareAndSwapUint32(word, value, value|new) {
-				break
-			}
-		}
-	case linux.HEMI_USERSPACE_ATOMIC_U32_AND:
-		for {
-			value = atomic.LoadUint32(word)
-			if atomic.CompareAndSwapUint32(word, value, value&new) {
-				break
-			}
-		}
-	case linux.HEMI_USERSPACE_ATOMIC_U32_XOR:
-		for {
-			value = atomic.LoadUint32(word)
-			if atomic.CompareAndSwapUint32(word, value, value^new) {
-				break
-			}
-		}
 	default:
 		alias.release()
 		return 0, nil, false
