@@ -61,7 +61,7 @@ const (
 	hemiGvisorHotAliasSlots     = linux.HEMI_USERSPACE_HOT_ALIAS_SLOTS
 	hemiGvisorAtomicAliasWeight = 4
 	hemiGvisorAliasLaneSize     = linux.HEMI_USERSPACE_HOT_ALIAS_LANE_SIZE
-	hemiGvisorAliasMetaSize     = linux.HEMI_USERSPACE_HOT_ALIAS_META_SIZE
+	hemiGvisorAliasMetaSize     = linux.HEMI_USERSPACE_HOT_ALIAS_DATA_OFFSET
 	hemiGvisorAliasCacheWarmup  = 256
 	hemiGvisorAliasLaneWarmup   = 16
 	hemiGvisorCollisionWarmup   = 128
@@ -355,6 +355,10 @@ func (c *hemiGvisorHotAliasCache) pointer(slot uint32, addr hostarch.Addr) unsaf
 }
 
 func (c *hemiGvisorHotAliasCache) loadSlot(slot uint32, addr hostarch.Addr, length int, access uint32) (hemiGvisorHotAliasAccess, bool) {
+	// Borrowed PTEs enforce the source mapping's actual permissions.
+	if access&linux.HEMI_USERSPACE_ACCESS_IGNORE_PERMISSIONS != 0 {
+		return hemiGvisorHotAliasAccess{}, false
+	}
 	desc := c.descriptor(slot)
 	generation := atomic.LoadUint32(&desc.Generation)
 	if generation == 0 {
@@ -563,6 +567,9 @@ func (s *subprocess) hemiGvisorResolveHotAlias(addr hostarch.Addr, length int, a
 }
 
 func (s *subprocess) hemiGvisorGetHotAlias(addr hostarch.Addr, length int, access uint32) (hemiGvisorHotAliasAccess, error, bool) {
+	if access&linux.HEMI_USERSPACE_ACCESS_IGNORE_PERMISSIONS != 0 {
+		return hemiGvisorHotAliasAccess{}, nil, false
+	}
 	if length < hemiGvisorHotAliasMinBytes || length > hemiGvisorHotAliasMaxBytes ||
 		hemiGvisorAliasPageBase(addr) != hemiGvisorAliasPageBase(addr+hostarch.Addr(length-1)) {
 		return hemiGvisorHotAliasAccess{}, nil, false
