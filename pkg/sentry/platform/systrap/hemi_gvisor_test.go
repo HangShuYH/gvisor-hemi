@@ -848,6 +848,39 @@ func TestHemiGvisorAddressSpaceIOIterUsesRingBuffer(t *testing.T) {
 	}
 }
 
+func TestHemiGvisorAliasDisabled(t *testing.T) {
+	if hemiGvisorAliasEnabled {
+		t.Skip("alias ablation is disabled")
+	}
+	s := &subprocess{}
+	addr := hostarch.Addr(linux.HEMI_USERSPACE_VMAR_START)
+	buf := make([]byte, hostarch.PageSize)
+	ars := hostarch.AddrRangeSeqOf(hostarch.AddrRange{Start: addr, End: addr + 4})
+	// With no device, every public access must retain the portal's unavailable
+	// result, without admitting a cache even after exceeding the warmup count.
+	check := func(err error) {
+		t.Helper()
+		if _, ok := err.(platform.AddressSpaceIOUnavailable); !ok {
+			t.Fatalf("access returned %T(%v), want portal unavailable", err, err)
+		}
+	}
+	for i := 0; i <= hemiGvisorAliasCacheWarmup; i++ {
+		_, err := s.CopyIn(addr, buf)
+		check(err)
+		_, err = s.CopyOut(addr, buf)
+		check(err)
+		_, err = s.hemiGvisorAtomicUint32(addr, linux.HEMI_USERSPACE_ATOMIC_U32_LOAD, 0, 0)
+		check(err)
+		_, err = s.CopyInToIter(ars, nil, nil)
+		check(err)
+		_, err = s.CopyOutFromIter(ars, nil, nil)
+		check(err)
+	}
+	if s.hemiGvisorHotAlias.Load() != nil || s.hemiGvisorHotAliasAdmission.Load() != 0 {
+		t.Fatal("disabled alias path created a cache or updated admission")
+	}
+}
+
 func TestHemiGvisorHotAliasLazyAdmission(t *testing.T) {
 	const addr = hostarch.Addr(linux.HEMI_USERSPACE_VMAR_START)
 	var s subprocess

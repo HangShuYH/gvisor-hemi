@@ -41,6 +41,10 @@ const hemiGvisorDevicePath = "/dev/hemi_userspace"
 
 const hemiGvisorUserMemMax = 16 * hostarch.PageSize
 
+// This ablation disables only alias access. HEMI memory management and the
+// existing ring/ACCESS/ATOMIC paths still use the unmodified Host kernel.
+const hemiGvisorAliasEnabled = false
+
 const (
 	hemiGvisorRingLaneCount        = 32
 	hemiGvisorRingEntries          = linux.HEMI_USERSPACE_RING_ENTRIES
@@ -1274,8 +1278,10 @@ func (s *subprocess) hemiGvisorTryHotAliasCopyOutFromIter(ars hostarch.AddrRange
 }
 
 func (s *subprocess) copyOutFromIter(ars hostarch.AddrRangeSeq, src safemem.Reader, handleFault platform.AddressSpaceIOFaultHandler, enterFn hemiGvisorRingEnterFunc) (int64, error) {
-	if n, err, ok := s.hemiGvisorTryHotAliasCopyOutFromIter(ars, src, handleFault); ok {
-		return n, err
+	if hemiGvisorAliasEnabled {
+		if n, err, ok := s.hemiGvisorTryHotAliasCopyOutFromIter(ars, src, handleFault); ok {
+			return n, err
+		}
 	}
 	device, lane, mmid, err := s.hemiGvisorAcquireRingLane(ars)
 	if err != nil {
@@ -1381,8 +1387,10 @@ func (s *subprocess) hemiGvisorTryHotAliasCopyInToIter(ars hostarch.AddrRangeSeq
 }
 
 func (s *subprocess) copyInToIter(ars hostarch.AddrRangeSeq, dst safemem.Writer, handleFault platform.AddressSpaceIOFaultHandler, enterFn hemiGvisorRingEnterFunc) (int64, error) {
-	if n, err, ok := s.hemiGvisorTryHotAliasCopyInToIter(ars, dst, handleFault); ok {
-		return n, err
+	if hemiGvisorAliasEnabled {
+		if n, err, ok := s.hemiGvisorTryHotAliasCopyInToIter(ars, dst, handleFault); ok {
+			return n, err
+		}
 	}
 	device, lane, mmid, err := s.hemiGvisorAcquireRingLane(ars)
 	if err != nil {
@@ -1504,9 +1512,11 @@ func (s *subprocess) CopyIn(addr hostarch.Addr, dst []byte) (int, error) {
 	if len(dst) == 0 {
 		return 0, nil
 	}
-	if n, err, ok := s.hemiGvisorTryHotAliasCopy(
-		addr, dst, linux.HEMI_USERSPACE_ACCESS_READ); ok {
-		return n, err
+	if hemiGvisorAliasEnabled {
+		if n, err, ok := s.hemiGvisorTryHotAliasCopy(
+			addr, dst, linux.HEMI_USERSPACE_ACCESS_READ); ok {
+			return n, err
+		}
 	}
 	return s.hemiGvisorCopy(addr, dst, linux.HEMI_USERSPACE_ACCESS_READ, linux.HEMI_USERSPACE_RING_OP_READ)
 }
@@ -1544,9 +1554,11 @@ func (s *subprocess) CopyOut(addr hostarch.Addr, src []byte) (int, error) {
 	if len(src) == 0 {
 		return 0, nil
 	}
-	if n, err, ok := s.hemiGvisorTryHotAliasCopy(
-		addr, src, linux.HEMI_USERSPACE_ACCESS_WRITE); ok {
-		return n, err
+	if hemiGvisorAliasEnabled {
+		if n, err, ok := s.hemiGvisorTryHotAliasCopy(
+			addr, src, linux.HEMI_USERSPACE_ACCESS_WRITE); ok {
+			return n, err
+		}
 	}
 	return s.hemiGvisorCopy(addr, src, linux.HEMI_USERSPACE_ACCESS_WRITE, linux.HEMI_USERSPACE_RING_OP_WRITE)
 }
@@ -1633,8 +1645,10 @@ func (s *subprocess) hemiGvisorAtomicUint32(addr hostarch.Addr, op, old, new uin
 	if !hemiGvisorContainsUserMem(addr, 4) {
 		return 0, platform.AddressSpaceIOUnavailable{}
 	}
-	if value, err, ok := s.hemiGvisorTryHotAliasAtomicUint32(addr, op, old, new); ok {
-		return value, err
+	if hemiGvisorAliasEnabled {
+		if value, err, ok := s.hemiGvisorTryHotAliasAtomicUint32(addr, op, old, new); ok {
+			return value, err
+		}
 	}
 	device := s.hemiGvisorDevice
 	if device == nil || !s.hemiGvisorActive() {
