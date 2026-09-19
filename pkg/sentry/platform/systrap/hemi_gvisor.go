@@ -55,8 +55,20 @@ const (
 	// avoids ring lane acquisition and descriptor validation. This threshold
 	// keeps syscall metadata and futex-adjacent copies off the batching path.
 	hemiGvisorRingMinBytes      = 256
-	hemiGvisorHotAliasMinBytes  = 1
-	hemiGvisorHotAliasMaxBytes  = hostarch.PageSize
+	hemiGvisorHotAliasMinBytes = 1
+	// The hot-alias window for the per-syscall user-memory path covers one
+	// alias batch of up to 16 pages (64 KiB): the Host adaptor and core accept a
+	// resolve of at most that many pages, and the lease itself still spans the
+	// whole 2 MiB lane. A hit here removes both the ring lane acquisition and
+	// the ENTER_RING ioctl, which is what makes 64 KiB pipe/socket copies fast.
+	hemiGvisorHotAliasMaxBytes = 16 * hostarch.PageSize
+	// Stream copies (AddressSpaceIOIter) batch through a 512 KiB ring lane, so
+	// the per-request ioctl saving is small while a copied store through the
+	// alias lane is measurably slower than filling the bounce buffer and
+	// letting the kernel write the application memory. Keep streaming copies at
+	// the page-sized window: they hit an already resident lane but never grow a
+	// large alias window of their own.
+	hemiGvisorStreamHotAliasMaxBytes = hostarch.PageSize
 	hemiGvisorHotAliasHitBytes  = hemiGvisorRingBatchBytes
 	hemiGvisorHotAliasSlots     = linux.HEMI_USERSPACE_HOT_ALIAS_SLOTS
 	hemiGvisorAtomicAliasWeight = 4
@@ -617,13 +629,24 @@ func (s *subprocess) hemiGvisorGetHotAlias(addr hostarch.Addr, length int, acces
 	return alias, nil, true
 }
 
-func (s *subprocess) hemiGvisorGetHotAliasForCopy(addr hostarch.Addr, length int, access uint32) (hemiGvisorHotAliasAccess, error, bool) {
-	if length > hemiGvisorHotAliasMaxBytes && length <= hemiGvisorHotAliasHitBytes {
+func (s *subprocess) hemiGvisorGetHotAliasForCopy(addr hostarch.Addr, length int, access uint32, maxBytes int) (hemiGvisorHotAliasAccess, error, bool) {
+	if length > maxBytes && length <= hemiGvisorHotAliasHitBytes {
 		if cache := s.hemiGvisorHotAlias.Load(); cache != nil {
 			if _, alias, hit := cache.load(addr, length, access); hit {
 				return alias, nil, true
 			}
 		}
+		return hemiGvisorHotAliasAccess{}, nil, false
+	}
+	return s.hemiGvisorGetHotAliasBounded(addr, length, access, maxBytes)
+}
+
+// hemiGvisorGetHotAliasBounded is hemiGvisorGetHotAlias with a caller-specific
+// window: a request larger than maxBytes never resolves a lane of its own, so a
+// streaming copy cannot widen the alias window that the per-syscall path
+// established.
+func (s *subprocess) hemiGvisorGetHotAliasBounded(addr hostarch.Addr, length int, access uint32, maxBytes int) (hemiGvisorHotAliasAccess, error, bool) {
+	if length > maxBytes {
 		return hemiGvisorHotAliasAccess{}, nil, false
 	}
 	return s.hemiGvisorGetHotAlias(addr, length, access)
@@ -1163,7 +1186,7 @@ func (s *subprocess) CopyOutFromIter(ars hostarch.AddrRangeSeq, src safemem.Read
 // Admission is attempted only AFTER releasing the acquired prefix: resolving a
 // missing lane while holding another reader could block on that reader's COW
 // revocation. A miss consumes no stream data and retains the ring path.
-func (s *subprocess) hemiGvisorTryHotAliasIOVec(ars hostarch.AddrRangeSeq, access uint32, io func(safemem.BlockSeq) (uint64, error)) (int64, error, bool) {
+func (s *subprocess) hemiGvisorTryHotAliasIOVec(ars hostarch.AddrRangeSeq, access uint32, maxBytes int, io func(safemem.BlockSeq) (uint64, error)) (int64, error, bool) {
 	const maxRanges = 8
 	if ars.NumRanges() > maxRanges || ars.NumBytes() <= 0 ||
 		ars.NumBytes() > int64(hemiGvisorHotAliasHitBytes) {
@@ -1190,7 +1213,8 @@ func (s *subprocess) hemiGvisorTryHotAliasIOVec(ars hostarch.AddrRangeSeq, acces
 		}
 		if !hit {
 			release()
-			if admitted, err, ok := s.hemiGvisorGetHotAlias(ar.Start, int(ar.Length()), access); ok && err == nil {
+			if admitted, err, ok := s.hemiGvisorGetHotAliasBounded(
+				ar.Start, int(ar.Length()), access, maxBytes); ok && err == nil {
 				admitted.release()
 			}
 			return 0, nil, false
@@ -1212,7 +1236,8 @@ func (s *subprocess) hemiGvisorTryHotAliasIOVec(ars hostarch.AddrRangeSeq, acces
 
 func (s *subprocess) hemiGvisorTryHotAliasCopyOutFromIter(ars hostarch.AddrRangeSeq, src safemem.Reader, handleFault platform.AddressSpaceIOFaultHandler) (int64, error, bool) {
 	if ars.NumRanges() != 1 {
-		return s.hemiGvisorTryHotAliasIOVec(ars, linux.HEMI_USERSPACE_ACCESS_WRITE, src.ReadToBlocks)
+		return s.hemiGvisorTryHotAliasIOVec(ars, linux.HEMI_USERSPACE_ACCESS_WRITE,
+			hemiGvisorStreamHotAliasMaxBytes, src.ReadToBlocks)
 	}
 	if ars.NumBytes() <= 0 ||
 		ars.NumBytes() > int64(hemiGvisorHotAliasHitBytes) {
@@ -1221,7 +1246,8 @@ func (s *subprocess) hemiGvisorTryHotAliasCopyOutFromIter(ars hostarch.AddrRange
 	ar := ars.Head()
 	for attempt := 0; attempt < 2; attempt++ {
 		alias, err, ok := s.hemiGvisorGetHotAliasForCopy(
-			ar.Start, int(ar.Length()), linux.HEMI_USERSPACE_ACCESS_WRITE)
+			ar.Start, int(ar.Length()), linux.HEMI_USERSPACE_ACCESS_WRITE,
+			hemiGvisorStreamHotAliasMaxBytes)
 		if faultAddr, fault := hemiGvisorFileFaultAddr(err); fault && handleFault != nil {
 			if err := handleFault(faultAddr, hostarch.Write); err != nil {
 				return 0, hemiGvisorHotAliasStreamError(err), true
@@ -1317,7 +1343,8 @@ func (s *subprocess) CopyInToIter(ars hostarch.AddrRangeSeq, dst safemem.Writer,
 
 func (s *subprocess) hemiGvisorTryHotAliasCopyInToIter(ars hostarch.AddrRangeSeq, dst safemem.Writer, handleFault platform.AddressSpaceIOFaultHandler) (int64, error, bool) {
 	if ars.NumRanges() != 1 {
-		return s.hemiGvisorTryHotAliasIOVec(ars, linux.HEMI_USERSPACE_ACCESS_READ, dst.WriteFromBlocks)
+		return s.hemiGvisorTryHotAliasIOVec(ars, linux.HEMI_USERSPACE_ACCESS_READ,
+			hemiGvisorStreamHotAliasMaxBytes, dst.WriteFromBlocks)
 	}
 	if ars.NumBytes() <= 0 ||
 		ars.NumBytes() > int64(hemiGvisorHotAliasHitBytes) {
@@ -1326,7 +1353,8 @@ func (s *subprocess) hemiGvisorTryHotAliasCopyInToIter(ars hostarch.AddrRangeSeq
 	ar := ars.Head()
 	for attempt := 0; attempt < 2; attempt++ {
 		alias, err, ok := s.hemiGvisorGetHotAliasForCopy(
-			ar.Start, int(ar.Length()), linux.HEMI_USERSPACE_ACCESS_READ)
+			ar.Start, int(ar.Length()), linux.HEMI_USERSPACE_ACCESS_READ,
+			hemiGvisorStreamHotAliasMaxBytes)
 		if faultAddr, fault := hemiGvisorFileFaultAddr(err); fault && handleFault != nil {
 			if err := handleFault(faultAddr, hostarch.Read); err != nil {
 				return 0, hemiGvisorHotAliasStreamError(err), true
@@ -1528,7 +1556,8 @@ func (s *subprocess) hemiGvisorTryHotAliasCopy(addr hostarch.Addr, buf []byte, a
 		hemiGvisorAliasPageBase(addr) != hemiGvisorAliasPageBase(addr+hostarch.Addr(len(buf)-1)) {
 		return 0, nil, false
 	}
-	alias, err, ok := s.hemiGvisorGetHotAliasForCopy(addr, len(buf), access)
+	alias, err, ok := s.hemiGvisorGetHotAliasForCopy(
+		addr, len(buf), access, hemiGvisorHotAliasMaxBytes)
 	if !ok || err != nil {
 		return 0, err, ok
 	}
