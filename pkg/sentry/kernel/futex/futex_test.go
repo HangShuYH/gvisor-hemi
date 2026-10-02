@@ -66,6 +66,54 @@ func (t testData) GetSharedKey(addr hostarch.Addr) (Key, error) {
 	}, nil
 }
 
+type hemiTestData struct {
+	testData
+	id uint64
+}
+
+func (d hemiTestData) GetSharedKey(addr hostarch.Addr) (Key, error) {
+	return Key{Kind: KindSharedHemi, SharedID: d.id, Offset: uint64(addr) % hostarch.PageSize}, nil
+}
+
+func TestHemiSharedIdentityAcrossManagers(t *testing.T) {
+	parent := NewManager()
+	child := parent.Fork()
+	d := hemiTestData{testData: newTestData(2 * hostarch.PageSize), id: 19}
+	w := newPreparedTestWaiter(t, child, d, hostarch.PageSize+8, false, 0, ^uint32(0))
+	defer child.WaitComplete(w, d)
+	other := d
+	other.id++
+	if n, err := parent.Wake(other, 8, false, ^uint32(0), 1); n != 0 || err != nil {
+		t.Fatalf("unrelated shared object wake: (%d, %v)", n, err)
+	}
+	if n, err := parent.Wake(d, 8, true, ^uint32(0), 1); n != 0 || err != nil {
+		t.Fatalf("private wake: (%d, %v)", n, err)
+	}
+	if n, err := parent.Wake(d, 8, false, ^uint32(0), 1); n != 1 || err != nil {
+		t.Fatalf("shared alias wake: (%d, %v)", n, err)
+	}
+	if !w.woken() {
+		t.Fatal("shared waiter not woken")
+	}
+}
+
+func TestHemiSharedRequeueCount(t *testing.T) {
+	parent := NewManager()
+	child := parent.Fork()
+	d := hemiTestData{testData: newTestData(2 * hostarch.PageSize), id: 23}
+	w := newPreparedTestWaiter(t, child, d, hostarch.PageSize+8, false, 0, ^uint32(0))
+	defer child.WaitComplete(w, d)
+	if n, err := parent.RequeueCmp(d, 8, 16, false, 0, 0, 1); n != 1 || err != nil {
+		t.Fatalf("requeue must count moved waiters: (%d, %v)", n, err)
+	}
+	if n, err := parent.Wake(d, 8, false, ^uint32(0), 1); n != 0 || err != nil {
+		t.Fatalf("old key wake: (%d, %v)", n, err)
+	}
+	if n, err := parent.Wake(d, 16, false, ^uint32(0), 1); n != 1 || err != nil {
+		t.Fatalf("requeued key wake: (%d, %v)", n, err)
+	}
+}
+
 func futexKind(private bool) string {
 	if private {
 		return "private"

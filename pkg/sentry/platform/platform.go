@@ -596,6 +596,13 @@ type AddressSpaceReservedRange interface {
 	ReservedAddressRange() hostarch.AddrRange
 }
 
+// AddressSpaceSharedFutexKey identifies shared pages in a platform-managed
+// range. Positive IDs survive fork and remap and are never reused; zero denotes
+// a private mapping. IDs convey no authority to access the underlying page.
+type AddressSpaceSharedFutexKey interface {
+	SharedFutexKey(addr hostarch.Addr) (uint64, error)
+}
+
 // NoAddressSpaceIO implements AddressSpaceIO methods by panicking.
 type NoAddressSpaceIO struct{}
 

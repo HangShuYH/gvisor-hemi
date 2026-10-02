@@ -454,6 +454,13 @@ func TestHemiGvisorUserMemResult(t *testing.T) {
 }
 
 func TestHemiGvisorRingABILayout(t *testing.T) {
+	key := linux.HemiUserspaceFutexKey{}
+	if unsafe.Sizeof(key) != 32 || key.SizeBytes() != 32 ||
+		unsafe.Offsetof(key.Access) != 16 || unsafe.Offsetof(key.Key) != 24 ||
+		linux.HEMI_USERSPACE_ENABLE_SHARED != 0x480f ||
+		linux.HEMI_USERSPACE_FUTEX_KEY != 0xc0204810 {
+		t.Fatalf("shared futex UAPI layout/ioctl mismatch: %+v", key)
+	}
 	setup := linux.HemiUserspaceRingSetup{}
 	if got, want := unsafe.Sizeof(setup), uintptr(16); got != want {
 		t.Fatalf("sizeof(HemiUserspaceRingSetup) = %d, want %d", got, want)

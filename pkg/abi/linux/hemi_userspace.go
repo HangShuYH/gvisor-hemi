@@ -112,6 +112,23 @@ type HemiUserspaceAtomicU32 struct {
 
 var HEMI_USERSPACE_ATOMIC_U32 = IOWR(HEMI_USERSPACE_IOCTL_TYPE, 0x06, uint32((*HemiUserspaceAtomicU32)(nil).SizeBytes()))
 
+// HemiUserspaceFutexKey is struct hemi_userspace_futex_key.
+//
+// +marshal
+type HemiUserspaceFutexKey struct {
+	_        structs.HostLayout
+	MMID     uint64
+	Addr     uint64
+	Access   uint32
+	Reserved uint32
+	Key      int64
+}
+
+var (
+	HEMI_USERSPACE_ENABLE_SHARED = IO(HEMI_USERSPACE_IOCTL_TYPE, 0x0f)
+	HEMI_USERSPACE_FUTEX_KEY     = IOWR(HEMI_USERSPACE_IOCTL_TYPE, 0x10, uint32((*HemiUserspaceFutexKey)(nil).SizeBytes()))
+)
+
 // HemiUserspaceProbeUser is struct hemi_userspace_probe_user.
 //
 // +marshal
