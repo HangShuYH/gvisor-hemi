@@ -43,6 +43,9 @@ const (
 	// KindSharedMappable indicates a shared futex on a memory mapping other
 	// than a private anonymous memory mapping.
 	KindSharedMappable
+
+	// KindSharedHemi identifies a shared page managed outside Sentry's VMAs.
+	KindSharedHemi
 )
 
 // Key represents something that a futex waiter may wait on.
@@ -60,9 +63,12 @@ type Key struct {
 	// it isn't.
 	MappingIdentity memmap.MappingIdentity
 
+	// SharedID is a never-reused page ID for KindSharedHemi; otherwise zero.
+	SharedID uint64
+
 	// If Kind is KindPrivate or KindSharedPrivate, Offset is the represented
 	// memory address. Otherwise, Offset is the represented offset into
-	// Mappable.
+	// Mappable, or the byte offset within the page for KindSharedHemi.
 	Offset uint64
 }
 
@@ -89,7 +95,11 @@ func (k *Key) addr() hostarch.Addr {
 // matches returns true if a wakeup on k2 should wake a waiter waiting on k.
 func (k *Key) matches(k2 *Key) bool {
 	// k.MappingIdentity is ignored; it's only used for reference counting.
-	return k.Kind == k2.Kind && k.Mappable == k2.Mappable && k.Offset == k2.Offset
+	return k.Kind == k2.Kind && k.Mappable == k2.Mappable && k.SharedID == k2.SharedID && k.Offset == k2.Offset
+}
+
+func (k *Key) shared() bool {
+	return k.Kind == KindSharedMappable || k.Kind == KindSharedHemi
 }
 
 // Target abstracts memory accesses and keys.
@@ -106,7 +116,7 @@ type Target interface {
 	LoadUint32(addr hostarch.Addr) (uint32, error)
 
 	// GetSharedKey returns a Key with kind KindSharedPrivate or
-	// KindSharedMappable corresponding to the memory mapped at address addr.
+	// KindSharedMappable or KindSharedHemi corresponding to the memory at addr.
 	//
 	// If GetSharedKey returns a Key with a non-nil MappingIdentity, a
 	// reference is held on the MappingIdentity, which must be dropped by the
@@ -375,7 +385,7 @@ type Manager struct {
 	// futexes.
 	privateBuckets [bucketCount]bucket `state:"zerovalue"`
 
-	// sharedBucket is the bucket for KindSharedMappable futexes. sharedBucket
+	// sharedBucket is the bucket for KindSharedMappable/KindSharedHemi futexes. It
 	// may be shared by multiple Managers. The sharedBucket pointer is
 	// immutable.
 	sharedBucket *bucket
@@ -399,7 +409,7 @@ func (m *Manager) Fork() *Manager {
 // lockBucket returns a locked bucket for the given key.
 // +checklocksacquire:b.mu
 func (m *Manager) lockBucket(k *Key) (b *bucket) {
-	if k.Kind == KindSharedMappable {
+	if k.shared() {
 		b = m.sharedBucket
 	} else {
 		b = &m.privateBuckets[bucketIndexForAddr(k.addr())]
@@ -421,7 +431,7 @@ func (m *Manager) lockBuckets(k1, k2 *Key) (b1, b2, lockedFirst, lockedSecond *b
 	// m.sharedBucket.
 
 	// Handle the common case first:
-	if k1.Kind != KindSharedMappable && k2.Kind != KindSharedMappable {
+	if !k1.shared() && !k2.shared() {
 		i1 := bucketIndexForAddr(k1.addr())
 		i2 := bucketIndexForAddr(k2.addr())
 		b1 = &m.privateBuckets[i1]
@@ -444,12 +454,12 @@ func (m *Manager) lockBuckets(k1, k2 *Key) (b1, b2, lockedFirst, lockedSecond *b
 	// At least one of b1 or b2 should be m.sharedBucket.
 	b1 = m.sharedBucket
 	b2 = m.sharedBucket
-	if k1.Kind != KindSharedMappable {
+	if !k1.shared() {
 		b1 = m.lockBucket(k1)
 		b2.mu.NestedLock(futexBucketLockB)
 		return b1, b2, b1, b2
 	}
-	if k2.Kind != KindSharedMappable {
+	if !k2.shared() {
 		b2 = m.lockBucket(k2)
 		b1.mu.NestedLock(futexBucketLockB)
 		return b1, b2, b2, b1
@@ -510,7 +520,7 @@ func (m *Manager) doRequeue(t Target, addr, naddr hostarch.Addr, private bool, c
 	done := b1.wakeLocked(&k1, ^uint32(0), nwake)
 
 	// Requeue the number required.
-	b1.requeueLocked(t, b2, &k1, &k2, nreq)
+	done += b1.requeueLocked(t, b2, &k1, &k2, nreq)
 
 	return done, nil
 }

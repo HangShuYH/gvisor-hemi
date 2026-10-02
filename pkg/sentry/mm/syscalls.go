@@ -1438,8 +1438,23 @@ func (mm *MemoryManager) GetSharedFutexKey(ctx context.Context, addr hostarch.Ad
 		return futex.Key{}, linuxerr.EFAULT
 	}
 	if mm.reservedAR.IsSupersetOf(ar) {
-		// HEMI mappings are intentionally absent from the sentry VMA set. They
-		// have per-mm identity, equivalent to Linux FUT_OFF_MMSHARED.
+		// HEMI mappings are intentionally absent from the Sentry VMA set.
+		// Resolve shared identity through the platform, not the virtual address.
+		mm.activeMu.RLock()
+		defer mm.activeMu.RUnlock()
+		if provider, ok := mm.as.(platform.AddressSpaceSharedFutexKey); ok {
+			id, err := provider.SharedFutexKey(addr)
+			if err != nil {
+				return futex.Key{}, err
+			}
+			if id != 0 {
+				return futex.Key{
+					Kind:     futex.KindSharedHemi,
+					SharedID: id,
+					Offset:   uint64(addr) % hostarch.PageSize,
+				}, nil
+			}
+		}
 		return futex.Key{
 			Kind:   futex.KindSharedPrivate,
 			Offset: uint64(addr),

@@ -23,6 +23,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/contexttest"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/futex"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
+	"gvisor.dev/gvisor/pkg/sentry/platform"
 )
 
 func TestFindAvailableAvoidsReservedRange(t *testing.T) {
@@ -121,5 +122,38 @@ func TestGetSharedFutexKeyInReservedRange(t *testing.T) {
 	}
 	if key.Offset != uint64(addr) {
 		t.Errorf("GetSharedFutexKey() offset = %#x, want %#x", key.Offset, addr)
+	}
+}
+
+type sharedFutexTestAddressSpace struct {
+	platform.AddressSpace
+	id  uint64
+	err error
+}
+
+func (as *sharedFutexTestAddressSpace) SharedFutexKey(hostarch.Addr) (uint64, error) {
+	return as.id, as.err
+}
+
+func TestPlatformSharedFutexIdentity(t *testing.T) {
+	ctx := contexttest.Context(t)
+	as := &sharedFutexTestAddressSpace{id: 123}
+	mm := MemoryManager{
+		as:         as,
+		reservedAR: hostarch.AddrRange{Start: 0x50000000, End: 0x50001000},
+	}
+	addr := mm.reservedAR.Start + 12
+	key, err := mm.GetSharedFutexKey(ctx, addr)
+	if err != nil || key.Kind != futex.KindSharedHemi || key.SharedID != 123 || key.Offset != 12 {
+		t.Fatalf("shared key: (%+v, %v)", key, err)
+	}
+	as.id = 0
+	key, err = mm.GetSharedFutexKey(ctx, addr)
+	if err != nil || key.Kind != futex.KindSharedPrivate || key.Offset != uint64(addr) {
+		t.Fatalf("private key: (%+v, %v)", key, err)
+	}
+	as.err = linuxerr.EFAULT
+	if _, err := mm.GetSharedFutexKey(ctx, addr); !linuxerr.Equals(linuxerr.EFAULT, err) {
+		t.Fatalf("invalid mapping must not fall back to private key: %v", err)
 	}
 }

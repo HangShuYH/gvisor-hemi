@@ -116,6 +116,16 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 	unix.SYS_IOCTL: seccomp.Or{
 		seccomp.PerArg{
 			seccomp.NonNegativeFD{},
+			seccomp.EqualTo(linux.HEMI_USERSPACE_ENABLE_SHARED),
+			seccomp.EqualTo(0),
+		},
+		seccomp.PerArg{
+			seccomp.NonNegativeFD{},
+			seccomp.EqualTo(linux.HEMI_USERSPACE_FUTEX_KEY),
+			seccomp.AnyValue{},
+		},
+		seccomp.PerArg{
+			seccomp.NonNegativeFD{},
 			seccomp.EqualTo(linux.HEMI_USERSPACE_ALLOC_MM),
 			seccomp.AnyValue{},
 		},

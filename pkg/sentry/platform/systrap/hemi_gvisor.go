@@ -147,8 +147,9 @@ type hemiGvisorRingPool struct {
 }
 
 type hemiGvisorDeviceState struct {
-	file *fd.FD
-	fd   int32
+	file            *fd.FD
+	fd              int32
+	sharedAnonymous bool
 
 	mmidMu   sync.Mutex
 	nextMMID uint64
@@ -222,6 +223,11 @@ func hemiGvisorSetDeviceFD(deviceFile *fd.FD) {
 		releaseWake:    make(chan struct{}, 1),
 	}
 	state.ringPool = hemiGvisorSetupRingPool(state.fd)
+	// Opt in only after supporting stable shared futex keys. An older Host
+	// rejects the ioctl and continues forwarding shared mmap to the Sentry.
+	state.sharedAnonymous = hostsyscall.RawSyscallErrno6(
+		unix.SYS_IOCTL, uintptr(state.fd), uintptr(linux.HEMI_USERSPACE_ENABLE_SHARED),
+		0, 0, 0, 0) == 0
 
 	hemiGvisorDevice.Lock()
 	hemiGvisorDevice.state = state
@@ -1627,6 +1633,32 @@ func (s *subprocess) CompareAndSwapUint32(addr hostarch.Addr, old, value uint32)
 
 func (s *subprocess) LoadUint32(addr hostarch.Addr) (uint32, error) {
 	return s.hemiGvisorAtomicUint32(addr, linux.HEMI_USERSPACE_ATOMIC_U32_LOAD, 0, 0)
+}
+
+// SharedFutexKey implements platform.AddressSpaceSharedFutexKey.
+func (s *subprocess) SharedFutexKey(addr hostarch.Addr) (uint64, error) {
+	device := s.hemiGvisorDevice
+	if device == nil || !s.hemiGvisorActive() {
+		return 0, unix.EFAULT
+	}
+	if !device.sharedAnonymous {
+		return 0, nil
+	}
+	req := linux.HemiUserspaceFutexKey{
+		MMID:   s.hemiGvisorMMID,
+		Addr:   uint64(addr),
+		Access: linux.HEMI_USERSPACE_ACCESS_READ,
+	}
+	errno := hostsyscall.RawSyscallErrno6(
+		unix.SYS_IOCTL, uintptr(device.fd), uintptr(linux.HEMI_USERSPACE_FUTEX_KEY),
+		uintptr(unsafe.Pointer(&req)), 0, 0, 0)
+	if errno != 0 {
+		return 0, errno
+	}
+	if req.Key < 0 {
+		return 0, unix.EFAULT
+	}
+	return uint64(req.Key), nil
 }
 
 func (s *subprocess) hemiGvisorAtomicUint32(addr hostarch.Addr, op, old, new uint32) (uint32, error) {
